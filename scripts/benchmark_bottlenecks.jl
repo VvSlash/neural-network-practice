@@ -167,16 +167,27 @@ print("  caly krok (fwd+bwd+SGD): ")
 step_time = @belapsed (forward!($gr); backward!($gr); optimize!($gr, 1f-2))
 println("  szacunkowy czas epoki (6000 batchy): ", round(step_time * 6000; digits = 1), " s")
 
-# B6 - MaxPool (ponowny argmax w backward)
+# B6 - MaxPool (cache argmax z forward zamiast ponownego skanu w backward)
 
 println("\n[B6] MaxPool: _maxpool_forward / _maxpool_backward")
 m = MaxPool((2, 2))
 xp = randn(Float32, 28, 28, 6, BATCH)
 gp = randn(Float32, 14, 14, 6, BATCH)
+AWIDNN._maxpool_forward(m, xp) # wypełnienie cache argmax (wymagane przed backward)
 print("  forward  (28x28x6x10):   ")
 @btime AWIDNN._maxpool_forward($m, $xp)
-print("  backward (28x28x6x10):   ")
+print("  backward z cache (B6):   ")
 @btime AWIDNN._maxpool_backward($m, $xp, $gp)
+if isdefined(AWIDNN, :_maxpool_backward_recompute_into!)
+    gx_c = AWIDNN._fit!(m.ws, :gx, Float32, size(xp))
+    gx_r = similar(xp)
+    AWIDNN._maxpool_backward_into!(gx_c, m, gp)
+    AWIDNN._maxpool_backward_recompute_into!(gx_r, m, xp, gp)
+    println("  poprawnosc cache vs recompute: max|roznica| = ", maximum(abs.(gx_c .- gx_r)))
+    @assert isapprox(gx_c, gx_r; rtol = 1f-6) "MaxPool backward: rozjazd cache vs recompute"
+    print("  backward recompute (przed B6): ")
+    @btime AWIDNN._maxpool_backward_recompute_into!($gx_r, $m, $xp, $gp)
+end
 
 # B8 - DataLoader (kopie batchy i kopia całego zbioru przy shuffle)
 
