@@ -243,7 +243,7 @@ bez mapowania na graf), `ScalarOperator` (nieużywany w ścieżce CNN), `bce`/`b
 | B3  | Alokacja wyniku w każdym `forward`           | `_compute!`: `n.output = forward(...)`                                                                     | nowe tablice w każdej iteracji zamiast zapisu do bufora in-place                             |
 | B4  | Akumulacja gradientu nie-in-place            | `_accumulate!`: `n.gradient = n.gradient .+ g`                                                             | każda akumulacja alokuje nową tablicę (docelowo `.+=`, ale zob. ostrzeżenie o aliasingu w 6.5) |
 | B5  | `zerograd!` alokuje zera co krok             | `_zerograd!(::Variable)` = `zero(output)`                                                                  | bufory gradientów parametrów tworzone od nowa w każdym `backward!` (≈0,3 MB/batch)           |
-| B6  | Ponowne liczenie argmax w `backward` MaxPool | `_maxpool_backward`                                                                                        | drugie przejście okna zamiast zapamiętania indeksów z `forward`                              |
+| B6  | ~~Ponowne liczenie argmax w `backward` MaxPool~~ **✅ rozwiązane (B6)** | `_maxpool_backward_into!` (cache `:ihi`/`:iwi` z forward)                                                   | ~~drugie przejście okna~~ → scatter z cache; wariant `_maxpool_backward_recompute_into!` zachowany do testów |
 | B7  | Brak wielowątkowości w splocie i poolingu    | `_conv_*`, `_maxpool_*`                                                                                    | pętle jednowątkowe bez `Threads.@threads`/`@simd`; jedynie `Dense` (`*`) idzie przez BLAS    |
 | B8  | Kopie danych w `DataLoader`                  | `_select_last` (`layers.jl`), konstruktor z `shuffle=true`                                                 | każdy batch to kopia wycinka (brak `@view`); shuffle kopiuje **cały zbiór** raz na epokę (permutacja 60000 obrazów ≈ 180 MB) |
 | B9  | Alokacje w Dropout                           | `forward(dropout_op)`                                                                                      | tymczasowa tablica `rand(T, size(x))` + nowa `BitArray` maski per batch; w trybie eval dodatkowo `copy(x)` |
@@ -262,7 +262,11 @@ bez mapowania na graf), `ScalarOperator` (nieużywany w ścieżce CNN), `bce`/`b
 >   `OPTYMALIZACJA-P1-AKUMULACJA.md` (rozłączne bufory gradientów `gradbuf` —
 >   aliasing z 6.5 usunięty; protokół jąder `backward!` in-place dla `*`, splotu
 >   i MaxPoola; pominięcie gradientu wejść `Constant`; backward 317 KiB → 17 KiB,
->   epoka ~12.1 s / 680 MiB, identyczna trajektoria uczenia).
+>   epoka ~12.1 s / 680 MiB, identyczna trajektoria uczenia),
+> - krok **P1 (cache argmax w MaxPool, B6) zrealizowany** — zob.
+>   `OPTYMALIZACJA-P1-ARGMAX.md` (zapis `:ihi`/`:iwi` w forward; backward scatter
+>   z cache zamiast ponownego skanu okien; backward MaxPool 183 µs → 12 µs,
+>   pełny backward! 1.1 ms → 0.7 ms, epoka ~9.7 s szac., identyczna trajektoria).
 
 
 | Prio   | Krok                                                                                                                                                                                 | Gdzie                                    | Oczekiwany efekt                                              | Nakład      |

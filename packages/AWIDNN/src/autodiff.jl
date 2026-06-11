@@ -721,6 +721,8 @@ function maxpool_op end
 
 # Optymalizacja P1: wynik pisany do bufora "out" (węzła grafu); każda komórka "y"
 # jest nadpisywana, więc bufor nie wymaga zerowania.
+# Optymalizacja P1/B6: równolegle zapisuje pozycję argmax (":ihi", ":iwi") w "m.ws"
+# — backward odczytuje cache zamiast ponownie skanować okna.
 function _maxpool_forward!(out, m, x::AbstractArray{T,4}) where {T}
     kH, kW = m.pool # rozmiar okna
     sH, sW = m.stride # krok per wymiar
@@ -729,38 +731,42 @@ function _maxpool_forward!(out, m, x::AbstractArray{T,4}) where {T}
     H_out = div(H + 2pH - kH, sH) + 1 # rozmiar wyjścia - identyczna formuła jak przy Conv
     W_out = div(Wd + 2pW - kW, sW) + 1
     y = _ensure(out, T, (H_out, W_out, C, B)) # bufor wyniku (reużywany między iteracjami)
+    ihi = _fit!(m.ws, :ihi, Int32, (H_out, W_out, C, B)) # cache wiersza zwycięzcy max (0 = brak)
+    iwi = _fit!(m.ws, :iwi, Int32, (H_out, W_out, C, B)) # cache kolumny zwycięzcy max
     @inbounds for b = 1:B, c = 1:C, h = 1:H_out, w = 1:W_out # pętla po każdej pozycji wyjścia
         best = typemin(T) # lokalne maksimum dla bieżącego okna; "typemin(T)" - każda realna wartość wygrywa max
+        bhi, bwi = Int32(0), Int32(0) # pozycja zwycięzcy (0 = okno w całości poza brzegiem)
         for kh = 1:kH, kw = 1:kW # skan po oknie
             hi = (h - 1) * sH + kh - pH # pozycja w wejściu w osi "height"
             wi = (w - 1) * sW + kw - pW # pozycja w wejściu w osi "width"
             if 1 <= hi <= H && 1 <= wi <= Wd # pozycje poza brzegiem są ignorowane (są "-Inf")
                 v = x[hi, wi, c, b]
-                v > best && (best = v) # aktualizacja max w oknie
+                if v > best
+                    best = v
+                    bhi = Int32(hi); bwi = Int32(wi) # zapis argmax do cache (P1/B6)
+                end
             end
         end
         y[h, w, c, b] = best # zapis maksimum dla tej komórki wyjścia
+        ihi[h, w, c, b] = bhi; iwi[h, w, c, b] = bwi
     end
     return y
 end
 _maxpool_forward(m, x) = _maxpool_forward!(nothing, m, x) # wariant alokujący (pierwsze wywołanie / użycie poza grafem)
 
-# Backward dla MaxPool: 
-#gradient wpada TYLKO do pozycji, która wygrała max
+# Backward dla MaxPool:
+# gradient wpada TYLKO do pozycji, która wygrała max
 # (reguła łańcuchowa dla max: pochodna po zwycięskim argumencie = 1, reszta = 0).
 # W przypadku remisu trafia do pierwszej znalezionej pozycji (drobna niestabilność gradientu na patologicznych wejściach)
 
-# Rdzeń backward MaxPoola: scatter gradientu do wskazanego bufora "gx".
-# "seeded=true" (P1/B4) pomija zerowanie - wkłady dosumowywane do istniejącego gradientu.
-function _maxpool_backward_into!(gx::AbstractArray{T,4}, m, x::AbstractArray{T,4}, g::AbstractArray{Tg,4}, seeded::Bool = false) where {T, Tg}
+# Wariant referencyjny (bez cache): ponownie skanuje okna — do testów poprawności i benchmarku „przed".
+function _maxpool_backward_recompute_into!(gx::AbstractArray{T,4}, m, x::AbstractArray{T,4}, g::AbstractArray{Tg,4}, seeded::Bool = false) where {T, Tg}
     kH, kW = m.pool # rozmiar okna per wymiar
     sH, sW = m.stride # krok per wymiar
     pH, pW = m.pad # padding per wymiar
     H, Wd, C, B = size(x) # rozmiary wejścia (przestrzenne, kanały, batch)
     H_out, W_out, _, _ = size(g) # rozmiary gradientu wyjścia (odpowiada kształtowi y z forwarda)
     seeded || fill!(gx, zero(T)) # start od zer (pierwszy wkład); wkłady tylko do pozycji argmax (wygrywających max)
-    # argmax jest liczony "w locie" (drugi raz) zamiast pamiętać go z forwarda.
-    # To oszczędza pamięć; narzut CPU przy standardowych oknach (2 x 2) jest pomijalny.
     @inbounds for b = 1:B, c = 1:C, h = 1:H_out, w = 1:W_out # pętla po wszystkich pozycjach wyjścia
         best = typemin(T) # aktualny max w oknie
         bhi, bwi = 0, 0 # pozycja aktualnego maxa (0 = jeszcze nie znaleziono nic realnego)
@@ -780,11 +786,28 @@ function _maxpool_backward_into!(gx::AbstractArray{T,4}, m, x::AbstractArray{T,4
     return gx
 end
 
+# Rdzeń backward MaxPoola (P1/B6): scatter gradientu z cache argmax do bufora "gx".
+# Wymaga wcześniejszego "_maxpool_forward!" na tej samej warstwie "m".
+# "seeded=true" (P1/B4) pomija zerowanie - wkłady dosumowywane do istniejącego gradientu.
+function _maxpool_backward_into!(gx::AbstractArray{T,4}, m, g::AbstractArray{Tg,4}, seeded::Bool = false) where {T, Tg}
+    ihi = get(m.ws.bufs, :ihi, nothing)::Union{Nothing, Array{Int32,4}}
+    iwi = get(m.ws.bufs, :iwi, nothing)::Union{Nothing, Array{Int32,4}}
+    ihi === nothing && error("MaxPool backward: brak cache argmax — wywołaj forward przed backward")
+    H_out, W_out, C, B = size(g) # rozmiary gradientu wyjścia (odpowiada kształtowi y z forwarda)
+    seeded || fill!(gx, zero(T)) # start od zer (pierwszy wkład)
+    @inbounds for b = 1:B, c = 1:C, h = 1:H_out, w = 1:W_out
+        hi = ihi[h, w, c, b] # wiersz zwycięzcy z cache forward
+        wi = iwi[h, w, c, b] # kolumna zwycięzcy z cache forward
+        hi > 0 && (gx[hi, wi, c, b] += g[h, w, c, b]) # scatter gradientu do argmax
+    end
+    return gx
+end
+
 # Wariant klasyczny: bufor ":gx" z przestrzeni roboczej warstwy (reużywany między
 # iteracjami); czytany tylko w obrębie jednego przejścia backward!, więc reużycie jest bezpieczne.
 function _maxpool_backward(m, x::AbstractArray{T,4}, g::AbstractArray{Tg,4}) where {T, Tg}
     gx = _fit!(m.ws, :gx, T, size(x))
-    _maxpool_backward_into!(gx, m, x, g)
+    _maxpool_backward_into!(gx, m, g)
     return (gx,) # krotka jednoelementowa (dla spójności API z innymi operatorami)
 end
 
@@ -802,7 +825,7 @@ function backward!(n::BroadcastedOperator{typeof(maxpool_op)}, m, x::AbstractArr
     tx = _grad_target!(n.inputs[2], T, size(x))
     if tx !== nothing # "nothing" = wejście Constant (gradient zbędny)
         gxbuf, seeded = tx
-        _maxpool_backward_into!(gxbuf, m, x, g, seeded)
+        _maxpool_backward_into!(gxbuf, m, g, seeded)
     end
     return true
 end

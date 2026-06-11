@@ -112,7 +112,7 @@ struct MaxPool{N}
     pool::NTuple{N, Int} # rozmiar okna w każdym z "N" wymiarów przestrzennych (np. "(height, width)")
     stride::NTuple{N, Int} # krok okna per-wymiar; domyślnie równy "pool"
     pad::NTuple{N, Int} # padding per-wymiar; poza brzegiem traktowany jak "-Inf"
-    ws::Workspace # bufor roboczy gradientu wejścia (":gx") współdzielony między iteracjami
+    ws::Workspace # bufory robocze: ":gx" (gradient wejścia), ":ihi"/":iwi" (cache argmax z forward)
 end
 
 # Spłaszczenie (height, width, channels, batch) -> (height*width*channels, batch).
