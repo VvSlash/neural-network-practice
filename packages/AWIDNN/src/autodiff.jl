@@ -102,9 +102,22 @@ _compute!(::Variable) = nothing
 # Optymalizacja P1: pierwsze wywołanie alokuje wyjście przez "forward",
 # kolejne piszą w miejscu do istniejącego bufora "n.output" przez "forward!";
 # przy zmianie kształtu jądra in-place same realokują bufor ("_ensure").
-function _compute!(n::BroadcastedOperator)
-    # "ntuple(f, N)" tworzy krotkę "(f(1), ..., f(N))"; tu zbiera ".output" z każdego wejścia.
-    # Rozpakowanie "..." rozwija krotkę na argumenty pozycyjne "forward"/"forward!".
+# Optymalizacja P2: parametry "T,G" wynikają z inferencji przy budowie grafu;
+# poniżej trzy warianty "_compute!" — tablica, skalar i zapasowy "NodeValue".
+function _compute!(n::BroadcastedOperator{F, T, G}) where {F, T<:AbstractArray, G<:AbstractArray} # tablica (np. "Array{Float32,4}")
+    vals = ntuple(i -> n.inputs[i].output, length(n.inputs))
+    out = n.output
+    n.output = out === nothing ? forward(n, vals...) : forward!(out, n, vals...)
+    return nothing
+end
+
+function _compute!(n::BroadcastedOperator{F, T, G}) where {F, T<:Real, G<:Real} # skalar ("logitcrossentropy", "sum")
+    vals = ntuple(i -> n.inputs[i].output, length(n.inputs))
+    n.output = forward(n, vals...)
+    return nothing
+end
+
+function _compute!(n::BroadcastedOperator{F, T, G}) where {F, T<:NodeValue, G<:NodeValue} # zapasowy, gdy inferencja zwróciła "NodeValue"
     vals = ntuple(i -> n.inputs[i].output, length(n.inputs))
     out = n.output
     n.output = out === nothing ? forward(n, vals...) : forward!(out, n, vals...)
@@ -226,6 +239,11 @@ _accumulate!(::Operator, ::Nothing) = nothing   # "nothing" = brak gradientu do 
 # Bezpieczeństwo aliasingu: bufor "n.gradient" jest własnością wyłączną Variable
 # (tworzony w "zerograd!"), a "g" pochodzi ze świeżych lub roboczych tablic jąder
 # backward (np. "g*Bᵀ", bufor ":gW" splotu) - nigdy nie jest tym samym buforem.
+function _accumulate!(n::Variable{T, T}, g::T) where {T<:AbstractArray} # konkretne "T" z inferencji (P2)
+    (n.gradient::T) .+= g
+    return nothing
+end
+
 function _accumulate!(n::Variable, g::NodeValue)
     buf = n.gradient
     if buf isa AbstractArray && g isa AbstractArray && size(buf) == size(g)
@@ -246,6 +264,24 @@ end
 # "reshape(g)") albo z buforem roboczym warstwy (":gx" splotu/MaxPoola).
 # Dzięki kopii gradient węzła nigdy nie aliasuje cudzej pamięci, więc kolejne
 # wkłady można dosumowywać w miejscu (".+=") bez ryzyka uszkodzenia innych gradientów.
+function _accumulate!(n::BroadcastedOperator{F, T, G}, g::G) where {F, T<:AbstractArray, G<:AbstractArray} # konkretne "G" (P2)
+    cur = n.gradient
+    if cur === nothing
+        buf = _ensure(n.gradbuf, eltype(G), size(g))
+        copyto!(buf, g)
+        n.gradbuf = buf
+        n.gradient = buf
+    else
+        (cur::G) .+= g
+    end
+    return nothing
+end
+
+function _accumulate!(n::BroadcastedOperator{F, T, G}, g::G) where {F, T<:Real, G<:Real} # skalarna strata (P2)
+    n.gradient = n.gradient === nothing ? g : n.gradient + g
+    return nothing
+end
+
 function _accumulate!(n::Operator, g::NodeValue)
     if g isa AbstractArray
         cur = n.gradient
@@ -900,4 +936,52 @@ function backward(::BroadcastedOperator{typeof(dropout_op)}, layer, x, g)
     T = eltype(g) # typ gradientu (dopasowany do batcha)
     scale = one(T) / (one(T) - T(layer.p)) # to samo skalowanie co w forward (symetria)
     return (nothing, g .* layer.mask .* scale) # dy/dx = mask*scale -> gradient też tylko na aktywnych pozycjach i przeskalowany
+end
+
+# Inferencja typów węzłów grafu (optymalizacja P2):
+# Konstruktor "BroadcastedOperator" ustala parametry "T,G" z typów wejść zamiast
+# domyślnego "NodeValue". Widoki "SubArray" z "DataLoadera" mapowane są na "Array{E,N}",
+# bo bufory wyjść operatorów alokowane są jako gęste tablice ("_ensure").
+
+# Mapowanie typu tablicy na gęsty bufor przechowujący (widok -> "Array{E,N}").
+_storage_array_type(::Type{<:AbstractArray{E, N}}) where {E, N} = Array{E, N}
+
+# Typ tablicowej wartości węzła; "nothing" dla liści nietablicowych (np. "Constant(Conv)").
+_valtype_of(::Constant{T}) where {T<:AbstractArray} = _storage_array_type(T)
+_valtype_of(::Variable{T}) where {T<:AbstractArray} = _storage_array_type(T)
+_valtype_of(n::BroadcastedOperator{F, T, G}) where {F, T<:AbstractArray, G} = _storage_array_type(T)
+_valtype_of(::GraphNode) = nothing
+
+# Pierwszy tablicowy typ w krotce wejść operatora (pomija liście nietablicowe, np. "Constant(Conv)").
+function _first_array_valtype(inputs::Tuple{Vararg{GraphNode}})
+    for inp in inputs
+        T = _valtype_of(inp)
+        T !== nothing && return T
+    end
+    return nothing
+end
+
+_loss_eltype(inputs) = (A = _first_array_valtype(inputs); A === nothing ? Float32 : eltype(A)) # typ elementu straty skalarnej
+
+function _flatten_types(inputs) # wyjście "flatten": (H,W,C,B) -> macierz (H*W*C,B)
+    A = _first_array_valtype(inputs)
+    A === nothing && return NodeValue, NodeValue
+    return Matrix{eltype(A)}, Matrix{eltype(A)}
+end
+
+# Para "(T,G)" wyjścia i gradientu operatora — wybór po "typeof(fun)" i typach wejść.
+_infer_op_types(::typeof(logitcrossentropy), inputs) =
+    (_loss_eltype(inputs), _loss_eltype(inputs))
+_infer_op_types(::typeof(sum), inputs) =
+    (_loss_eltype(inputs), _loss_eltype(inputs))
+_infer_op_types(::typeof(flatten_op), inputs) = _flatten_types(inputs)
+function _infer_op_types(fun, inputs) # domyślnie: ten sam typ tablicy co pierwsze tablicowe wejście
+    A = _first_array_valtype(inputs)
+    A === nothing && return NodeValue, NodeValue
+    return A, A
+end
+
+function BroadcastedOperator(fun::F, inputs::Vararg{GraphNode, N}; name::AbstractString="?") where {F, N}
+    T, G = _infer_op_types(fun, inputs) # konkretne "T,G" zamiast "NodeValue", gdy inferencja się powiedzie
+    return BroadcastedOperator{F, T, G}(inputs, nothing, nothing, nothing, String(name))
 end

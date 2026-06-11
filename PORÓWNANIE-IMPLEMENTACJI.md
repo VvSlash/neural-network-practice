@@ -239,7 +239,7 @@ bez mapowania na graf), `ScalarOperator` (nieużywany w ścieżce CNN), `bce`/`b
 | #   | Wąskie gardło                                | Lokalizacja                                                                                                | Przyczyna                                                                                    |
 | --- | -------------------------------------------- | ---------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
 | B1  | Naiwny splot 7-krotnie zagnieżdżonych pętli  | `_conv_forward`, `_conv_backward`                                                                          | złożoność `O(B·Cout·Hout·Wout·Cin·kH·kW)` na indeksowaniu skalarnym, bez BLAS/SIMD; najszybciej zmienna pętla wewnętrzna (`kw`→`wi`) chodzi po **drugim** wymiarze tablicy — dostęp niezgodny z układem column-major |
-| B2  | Typy abstrakcyjne w węzłach grafu            | `BroadcastedOperator{F,T,G}` z `T,G = NodeValue` (`Union{Real,AbstractArray}`), `output::Union{Nothing,T}` | boxing wyników i drobne alokacje; **uwaga**: dynamiczny dispatch zachodzi tylko na granicy węzłów (~20 węzłów/batch — koszt pomijalny), a jądra (`_conv_forward` itd.) specjalizują się po typach argumentów dzięki barierze funkcyjnej — zysk z naprawy jest umiarkowany i polega głównie na umożliwieniu buforów in-place |
+| B2  | ~~Typy abstrakcyjne w węzłach grafu~~ **✅ rozwiązane (B2)** | `BroadcastedOperator` z inferencją `T,G` (`_infer_op_types`, `_storage_array_type`) | ~~`NodeValue` na wszystkich operatorach~~ → konkretne `Array`/`Matrix`/`Float32`; zapasowy `NodeValue` gdy inferencja niemożliwa; czas epoki bez istotnej zmiany (dispatch ~20 węzłów był pomijalny) |
 | B3  | Alokacja wyniku w każdym `forward`           | `_compute!`: `n.output = forward(...)`                                                                     | nowe tablice w każdej iteracji zamiast zapisu do bufora in-place                             |
 | B4  | Akumulacja gradientu nie-in-place            | `_accumulate!`: `n.gradient = n.gradient .+ g`                                                             | każda akumulacja alokuje nową tablicę (docelowo `.+=`, ale zob. ostrzeżenie o aliasingu w 6.5) |
 | B5  | `zerograd!` alokuje zera co krok             | `_zerograd!(::Variable)` = `zero(output)`                                                                  | bufory gradientów parametrów tworzone od nowa w każdym `backward!` (≈0,3 MB/batch)           |
@@ -270,7 +270,11 @@ bez mapowania na graf), `ScalarOperator` (nieużywany w ścieżce CNN), `bce`/`b
 > - krok **P1 (widoki zamiast kopii w DataLoaderze, B8) zrealizowany** — zob.
 >   `OPTYMALIZACJA-P1-DATALOADER.md` (`@view` w `_select_last`; shuffle przez
 >   `perm` zamiast kopii zbioru; konstruktor shuffle 182 MiB → 469 KiB,
->   batch 31 KiB → 384 B, alokacje epoki 680 MiB → 324 MiB, identyczna trajektoria).
+>   batch 31 KiB → 384 B, alokacje epoki 680 MiB → 324 MiB, identyczna trajektoria),
+> - krok **P2 (stabilność typów węzłów grafu, B2) zrealizowany** — zob.
+>   `OPTYMALIZACJA-P2-TYPY.md` (inferencja `T,G` w `BroadcastedOperator`;
+>   `Array{Float32,4}`/`Matrix{Float32}`/`Float32` zamiast `NodeValue`; widoki
+>   `SubArray` normalizowane do `Array`; 0 węzłów `NodeValue` w CNN, identyczna trajektoria).
 
 
 | Prio   | Krok                                                                                                                                                                                 | Gdzie                                    | Oczekiwany efekt                                              | Nakład      |

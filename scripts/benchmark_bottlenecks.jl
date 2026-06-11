@@ -137,6 +137,43 @@ let
     println("  OK - max wzgledna roznica = ", round(maxrel, sigdigits = 3))
 end
 
+# B2 - stabilność typów węzłów grafu (konkretne T,G zamiast NodeValue)
+
+println("\n[B2] Stabilnosc typow wezlow (CNN, batch 10)")
+net_b2 = Chain(
+    Conv((3, 3), 1 => 6,  pad = 1, bias = false),
+    MaxPool((2, 2)),
+    Conv((3, 3), 6 => 16, pad = 1, bias = false),
+    MaxPool((2, 2)),
+    flatten,
+    Dense(784 => 84, relu),
+    Dropout(0.4),
+    Dense(84 => 10),
+)
+inp_b2 = Constant(randn(Float32, 28, 28, 1, BATCH))
+tgt_b2 = Constant(zeros(Float32, 10, BATCH))
+for j in 1:BATCH; tgt_b2.output[rand(1:10), j] = 1f0; end
+L_b2 = AWIDNN.logitcrossentropy(net_b2(inp_b2), tgt_b2)
+gr_b2 = graph(L_b2)
+let nodeval_count = 0
+for n in gr_b2
+    n isa AWIDNN.BroadcastedOperator || continue
+    T = typeof(n).parameters[2]
+    if T === AWIDNN.NodeValue
+        nodeval_count += 1
+        println("  NodeValue: ", n.name, " -> ", typeof(n))
+    end
+end
+@assert nodeval_count == 0 "B2: w grafie CNN pozostaly wezly NodeValue ($nodeval_count)"
+end
+println("  wezly BroadcastedOperator z konkretnym T: ",
+        count(n -> n isa AWIDNN.BroadcastedOperator, gr_b2), "/", length(gr_b2))
+println("  przyklady typow: ",
+        join([string(n.name, "=", typeof(n).parameters[2]) for n in gr_b2
+              if n isa AWIDNN.BroadcastedOperator][1:3], ", "), " ...")
+forward!(gr_b2); backward!(gr_b2)
+println("  OK - brak NodeValue, forward!/backward! bez bledu")
+
 # B2-B5 - pełny krok treningowy na grafie (dispatch, alokacje forward/backward/zerograd)
 
 println("\n[B2-B5] Pelny krok treningowy: forward! + backward! + optimize!")

@@ -23,6 +23,8 @@ abstract type GraphNode end
 abstract type Operator <: GraphNode end
 
 # Dozwolone typy wartości krążących w grafie (wyjścia i gradienty).
+# "NodeValue" to typ zapasowy; konstruktor "BroadcastedOperator" (w "autodiff.jl")
+# ustala konkretny typ tablicy lub skalar, gdy da się go wywnioskować z wejść.
 const NodeValue = Union{Real, AbstractArray}
 
 # Liść grafu o niezmiennej wartości (wejście/cel). 
@@ -66,7 +68,8 @@ mutable struct BroadcastedOperator{F, T<:NodeValue, G<:NodeValue} <: Operator
     gradbuf::Union{Nothing, G} # zachowany bufor gradientu (P1/B4); własność wyłączna węzła, reużywany między przejściami backward! (gradient nigdy nie współdzieli pamięci z innym węzłem)
     name::String # etykieta diagnostyczna (np. "W*x+b" - mnożenie macierzowe, "conv+b" - konwolucja z biasem, "bce" - binary cross-entropy)
 end
-BroadcastedOperator(fun::F, inputs::Vararg{GraphNode}; name::AbstractString="?") where {F} = BroadcastedOperator{F, NodeValue, NodeValue}(inputs, nothing, nothing, nothing, String(name)) # Operator o funkcji "fun" i dowolnej liczbie wejściach "inputs" i nazwie "name".
+# Konstruktor "BroadcastedOperator" — w "autodiff.jl" (po zdefiniowaniu znaczników
+# operatorów: "flatten_op", "logitcrossentropy", ...).
 
 # Przestrzeń robocza warstwy (optymalizacja P1):
 # bufory wielokrotnego użytku między iteracjami treningu (np. macierze im2col, gradienty wejść).
