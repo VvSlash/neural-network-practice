@@ -134,10 +134,11 @@ Dropout(p::Real) = Dropout(Float32(p), true, nothing, Workspace())
 # Iterator po batchach z ostatniego wymiaru danych.
 # Dla "data::Tuple{X, Y}" iteruje parami: "X" cięte po ostatnim wymiarze
 # (dla tensorów "(height, width, channels, batch)" bierze po "batch"), "Y" analogicznie.
-# Obsługa "shuffle" - implementacja w "layers.jl".
+# Obsługa "shuffle" i widoków batchy — implementacja w "layers.jl".
 
 struct DataLoader{D}
     data::D # zwykle "Tuple{X, Y}"; iteracja po ostatnim wymiarze każdej składowej
     batchsize::Int # liczba próbek w jednym batchu
-    shuffle::Bool # flaga pamiętająca, czy dane zostały przepermutowane w konstruktorze
+    shuffle::Bool # "true" = kolejność próbek losowana permutacją "perm"
+    perm::Union{Nothing, Vector{Int}} # wspólna permutacja indeksów; "nothing" gdy "shuffle=false"
 end

@@ -245,7 +245,7 @@ bez mapowania na graf), `ScalarOperator` (nieużywany w ścieżce CNN), `bce`/`b
 | B5  | `zerograd!` alokuje zera co krok             | `_zerograd!(::Variable)` = `zero(output)`                                                                  | bufory gradientów parametrów tworzone od nowa w każdym `backward!` (≈0,3 MB/batch)           |
 | B6  | ~~Ponowne liczenie argmax w `backward` MaxPool~~ **✅ rozwiązane (B6)** | `_maxpool_backward_into!` (cache `:ihi`/`:iwi` z forward)                                                   | ~~drugie przejście okna~~ → scatter z cache; wariant `_maxpool_backward_recompute_into!` zachowany do testów |
 | B7  | Brak wielowątkowości w splocie i poolingu    | `_conv_*`, `_maxpool_*`                                                                                    | pętle jednowątkowe bez `Threads.@threads`/`@simd`; jedynie `Dense` (`*`) idzie przez BLAS    |
-| B8  | Kopie danych w `DataLoader`                  | `_select_last` (`layers.jl`), konstruktor z `shuffle=true`                                                 | każdy batch to kopia wycinka (brak `@view`); shuffle kopiuje **cały zbiór** raz na epokę (permutacja 60000 obrazów ≈ 180 MB) |
+| B8  | ~~Kopie danych w `DataLoader`~~ **✅ rozwiązane (B8)** | `_select_last` (`@view`), `perm` w konstruktorze (`layers.jl`)                                              | ~~kopia batcha i całego zbioru przy shuffle~~ → widoki + wektor perm (~469 KiB); warianty `_select_last_copy`/`_dataloader_shuffle_copy` do testów |
 | B9  | Alokacje w Dropout                           | `forward(dropout_op)`                                                                                      | tymczasowa tablica `rand(T, size(x))` + nowa `BitArray` maski per batch; w trybie eval dodatkowo `copy(x)` |
 
 
@@ -266,7 +266,11 @@ bez mapowania na graf), `ScalarOperator` (nieużywany w ścieżce CNN), `bce`/`b
 > - krok **P1 (cache argmax w MaxPool, B6) zrealizowany** — zob.
 >   `OPTYMALIZACJA-P1-ARGMAX.md` (zapis `:ihi`/`:iwi` w forward; backward scatter
 >   z cache zamiast ponownego skanu okien; backward MaxPool 183 µs → 12 µs,
->   pełny backward! 1.1 ms → 0.7 ms, epoka ~9.7 s szac., identyczna trajektoria).
+>   pełny backward! 1.1 ms → 0.7 ms, epoka ~9.7 s szac., identyczna trajektoria),
+> - krok **P1 (widoki zamiast kopii w DataLoaderze, B8) zrealizowany** — zob.
+>   `OPTYMALIZACJA-P1-DATALOADER.md` (`@view` w `_select_last`; shuffle przez
+>   `perm` zamiast kopii zbioru; konstruktor shuffle 182 MiB → 469 KiB,
+>   batch 31 KiB → 384 B, alokacje epoki 680 MiB → 324 MiB, identyczna trajektoria).
 
 
 | Prio   | Krok                                                                                                                                                                                 | Gdzie                                    | Oczekiwany efekt                                              | Nakład      |

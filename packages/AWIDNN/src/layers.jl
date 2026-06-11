@@ -8,7 +8,7 @@
 # - fan_in   - liczba wejść neuronu/filtra; skalowanie inicjalizacji wag przez 1/sqrt(fan_in)
 #              ogranicza wariancję aktywacji na starcie treningu.
 # - onecold  - operacja odwrotna do one-hot: argmax wyników -> etykieta klasy.
-# - shuffle  - tasowanie kolejności próbek (wspólna permutacja cech X i etykiet Y).
+# - shuffle  - tasowanie przez wspólną permutację indeksów "perm" (bez kopii zbioru).
 
 using Random: randn, randperm
 
@@ -198,23 +198,37 @@ _nsamples(X::AbstractVector) = length(X) # 1D
 _nsamples(X::AbstractArray)  = size(X, ndims(X)) # n-D
 _nsamples(data::Tuple)       = _nsamples(first(data)) # para (X, Y)
 
-# Wybieranie podbatcha po ostatnim wymiarze:
-_select_last(X::AbstractVector, range) = X[range] # wektor: zwykłe indeksowanie zakresowe
+# Wybieranie podbatcha po ostatnim wymiarze (P1/B8: widok "@view", bez kopii danych).
 function _select_last(X::AbstractArray, range)
-    colons = ntuple(_ -> Colon(), ndims(X) - 1) # budujemy "(:, :, ..., :)" dla wszystkich osi poza ostatnią
-    return X[colons..., range] # ostatnia oś dostaje "range"
+    nd = ndims(X)
+    nd == 1 && return @view X[range] # wektor: widok zakresu lub indeksów
+    colons = ntuple(_ -> Colon(), nd - 1) # "(:, :, ..., :)" po wszystkich osiach poza ostatnią
+    return @view X[colons..., range] # ostatnia oś: zakres ciągły lub wektor indeksów (shuffle)
 end
 _select_last(data::Tuple, range) = map(x -> _select_last(x, range), data) # ta sama selekcja do każdej składowej tuple (X, Y, ...)
 
+# Wariant referencyjny (kopia) — do testów poprawności i benchmarku „przed" (B8).
+function _select_last_copy(X::AbstractArray, range)
+    nd = ndims(X)
+    nd == 1 && return X[range]
+    colons = ntuple(_ -> Colon(), nd - 1)
+    return X[colons..., range] # fancy indexing kopiuje; zakres ciągły też może materializować
+end
+_select_last_copy(data::Tuple, range) = map(x -> _select_last_copy(x, range), data)
+
+# Konstruktor DataLoader z kopią całego zbioru przy shuffle (stan sprzed P1/B8).
+function _dataloader_shuffle_copy(data::Tuple; batchsize::Integer = 1)
+    N = _nsamples(data)
+    idx = randperm(N)
+    shuffled = _select_last_copy(data, idx) # kopia ~N próbek × rozmiar tensora
+    return DataLoader{typeof(shuffled)}(shuffled, Int(batchsize), true, nothing)
+end
+
 # Funkcja DataLoader(data::Tuple; batchsize::Integer=1, shuffle::Bool=false) zwraca iterator po batchach "(X_batch, Y_batch)".
-# Gdy "shuffle=true", losuje permutację "randperm(N)" i stosuje ją raz do obu składowych "data".
+# Gdy "shuffle=true", losuje permutację "randperm(N)" i zapisuje ją w "perm" — dane pozostają w miejscu.
 function DataLoader(data::Tuple; batchsize::Integer = 1, shuffle::Bool = false)
-    if shuffle
-        N = _nsamples(data) # liczba próbek
-        idx = randperm(N) # jedna wspólna permutacja indeksów (ważne: X i Y muszą się przemieszczać razem)
-        data = _select_last(data, idx) # wybranie potasowanych danych już w konstruktorze
-    end
-    return DataLoader{typeof(data)}(data, Int(batchsize), shuffle) # typ danych parametrycznie dla wydajności iteracji
+    perm = shuffle ? randperm(_nsamples(data)) : nothing # jedna wspólna permutacja (X i Y muszą iść razem)
+    return DataLoader{typeof(data)}(data, Int(batchsize), shuffle, perm)
 end
 
 Base.length(dl::DataLoader) = cld(_nsamples(dl.data), dl.batchsize) # liczba batchy = ceil(N / batchsize)
@@ -223,5 +237,6 @@ function Base.iterate(dl::DataLoader, state::Int = 1)
     N = _nsamples(dl.data) # całkowita liczba próbek
     state > N && return nothing # koniec iteracji
     last_idx = min(state + dl.batchsize - 1, N) # domknięcie ostatniego batcha (może być niepełny)
-    return (_select_last(dl.data, state:last_idx), last_idx + 1) # (batch, następny stan)
+    batch_idx = dl.perm === nothing ? (state:last_idx) : (@view dl.perm[state:last_idx]) # indeksy bieżącego batcha
+    return (_select_last(dl.data, batch_idx), last_idx + 1) # (batch jako widok, następny stan)
 end

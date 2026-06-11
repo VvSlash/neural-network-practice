@@ -189,16 +189,37 @@ if isdefined(AWIDNN, :_maxpool_backward_recompute_into!)
     @btime AWIDNN._maxpool_backward_recompute_into!($gx_r, $m, $xp, $gp)
 end
 
-# B8 - DataLoader (kopie batchy i kopia całego zbioru przy shuffle)
+# B8 - DataLoader (widoki batchy + permutacja indeksów zamiast kopii zbioru przy shuffle)
 
-println("\n[B8] DataLoader: kopie danych")
+println("\n[B8] DataLoader: widoki zamiast kopii")
 Xfull = randn(Float32, 28, 28, 1, 60_000) # zbiór wielkości FashionMNIST (~188 MB)
 Yfull = zeros(Float32, 10, 60_000)
-print("  konstruktor shuffle=true (kopia calego zbioru): ")
+if isdefined(AWIDNN, :_dataloader_shuffle_copy)
+    print("  konstruktor shuffle copy (przed B8): ")
+    @btime AWIDNN._dataloader_shuffle_copy(($Xfull, $Yfull); batchsize = 10) samples = 3 evals = 1
+end
+print("  konstruktor shuffle perm (B8):     ")
 @btime AWIDNN.DataLoader(($Xfull, $Yfull); batchsize = 10, shuffle = true) samples = 5 evals = 1
 dl = AWIDNN.DataLoader((Xfull, Yfull); batchsize = 10, shuffle = false)
-print("  pobranie jednego batcha (kopia wycinka):        ")
+print("  pobranie jednego batcha (widok):   ")
 @btime first($dl)
+if isdefined(AWIDNN, :_select_last_copy)
+    xb, yb = first(dl)
+    xc, yc = AWIDNN._select_last_copy((Xfull, Yfull), 1:10)
+    println("  poprawnosc batch widok vs kopia: max|roznica| X = ",
+            maximum(abs.(xb .- xc)), ", Y = ", maximum(abs.(yb .- yc)))
+    @assert isapprox(xb, xc; rtol = 0f0) && isapprox(yb, yc; rtol = 0f0) "DataLoader batch: rozjazd"
+    Random.seed!(99)
+    dl_s = AWIDNN.DataLoader((Xfull, Yfull); batchsize = 10, shuffle = true)
+    xs, ys = AWIDNN._select_last_copy((Xfull, Yfull), dl_s.perm) # ten sam układ co kopia calego zbioru
+    for start in (1, 11, 59_991) # pierwszy, drugi i ostatni batch (6000 batchy po 10)
+        r = start:(start + 9)
+        xv, yv = AWIDNN._select_last((Xfull, Yfull), @view dl_s.perm[r])
+        xcp, ycp = AWIDNN._select_last_copy((xs, ys), r)
+        @assert isapprox(xv, xcp; rtol = 0f0) && isapprox(yv, ycp; rtol = 0f0) "DataLoader shuffle batch $start: rozjazd"
+    end
+    println("  poprawnosc shuffle perm vs copy: OK (batche 1, 2, 6000)")
+end
 
 # B9 - Dropout (alokacje maski i tymczasowej tablicy rand)
 
