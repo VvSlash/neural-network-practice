@@ -31,9 +31,15 @@ JuliaLocalPreferences.toml
 .ipynb_checkpoints/
 */.ipynb_checkpoints/
 
-# Cache danych MLDatasets pobranych lokalnie
+# Cache danych MLDatasets / torchvision pobranych lokalnie
 data/
 datasets/
+
+# Wirtualne środowisko i artefakty Pythona (notatnik PyTorch)
+.venv/
+venv/
+__pycache__/
+*.py[cod]
 
 # Pliki edytora / systemu
 .vscode/

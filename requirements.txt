@@ -1,0 +1,8 @@
+torch
+torchvision
+tensorflow
+numpy
+matplotlib
+jupyter
+nbconvert
+ipykernel
