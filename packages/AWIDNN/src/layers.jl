@@ -4,6 +4,12 @@
 # - warstwy mapowane na węzły grafu AD ("GraphNode"),
 # - funkcje pomocnicze kompatybilne stylistycznie z Flux ("onehotbatch", "onecold", "Descent", "setup", "update!", "DataLoader").
 
+# Słownik pojęć (uczenie maszynowe) - pierwsze wystąpienia w tym pliku:
+# - fan_in   - liczba wejść neuronu/filtra; skalowanie inicjalizacji wag przez 1/sqrt(fan_in)
+#              ogranicza wariancję aktywacji na starcie treningu.
+# - onecold  - operacja odwrotna do one-hot: argmax wyników -> etykieta klasy.
+# - shuffle  - tasowanie kolejności próbek (wspólna permutacja cech X i etykiet Y).
+
 using Random: randn, randperm
 
 # Dense - konstruktor i mapowanie na graf AD

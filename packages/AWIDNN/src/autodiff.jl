@@ -29,6 +29,32 @@ end
 # Backward: propaguje gradient w odwrotnej kolejności (od korzenia do liści),
 # akumulując wkłady do ".gradient" każdego węzła trenowalnego (Variable) zgodnie z regułą łańcuchową.
 
+# Słownik pojęć (uczenie maszynowe) - pierwsze wystąpienia w tym pliku:
+# - konsument (węzła X)  - operator, który ma X wśród swoich wejść, czyli UŻYWA wyniku X
+#                          w swoim obliczeniu (krawędź X -> konsument w grafie). Przykład: gdy
+#                          "y = relu(x)" i "z = x * w", to węzły "relu" i "*" są konsumentami "x".
+#                          W sieci-łańcuchu (jak tutaj) każdy węzeł ma dokładnie jednego konsumenta.
+# - wkład (gradientowy)  - częściowy gradient dopływający do węzła od JEDNEGO z jego konsumentów
+#                          (ang. contribution; to NIE jest "wejście"/input). W przykładzie wyżej:
+#                          dL/dx = wkład od "relu" + wkład od "*" - każdy konsument podczas swojego
+#                          "backward" odsyła do "x" jeden wkład, a pełny gradient węzła to suma
+#                          wkładów po wszystkich konsumentach (reguła łańcuchowa dla wielu ścieżek).
+# - seed (ziarno)        - gradient startowy korzenia grafu; dla skalarnej straty L: dL/dL = 1.
+# - logit                - surowe, nieznormalizowane wyjście klasyfikatora dla danej klasy (dowolna
+#                          liczba rzeczywista) PRZED softmaksem; nazwa od logit(p) = log(p/(1-p)),
+#                          czyli logarytmu szansy (log-odds) - odwrotności sigmoidy.
+# - softmax              - normalizacja logitów do rozkładu prawdopodobieństwa: p_i = exp(z_i)/Σ_j exp(z_j).
+# - entropia krzyżowa    - strata klasyfikacji: -Σ y_i*log(p_i); mierzy rozbieżność prognozy z etykietą.
+# - BCE                  - binarna entropia krzyżowa (przypadek dwóch klas).
+# - one-hot              - kodowanie etykiety jako wektora zer z jedynką na pozycji właściwej klasy.
+# - ReLU / sigmoid       - funkcje aktywacji: max(0, x) oraz 1/(1+e^-x).
+# - SGD / eta            - stochastyczny spadek wzdłuż gradientu; "eta" = learning rate (długość kroku).
+# - im2col / GEMM / BLAS - rozwinięcie okien splotu do kolumn macierzy / ogólne mnożenie macierzy
+#                          (GEneral Matrix Multiply) / zoptymalizowana biblioteka algebry liniowej.
+# - otoczenie (receptive field) - fragment wejścia widziany przez jedno okno splotu.
+# - pass-through         - operator przekazujący dane/gradient bez zmian (np. "identity", "flatten").
+# - inverted dropout     - wariant dropoutu ze skalowaniem 1/(1-p) w treningu; w ewaluacji identyczność.
+
 # Budowa grafu w porządku topologicznym:
 
 # "graph(root)" - dla korzenia (np. węzła straty) zwraca listę wszystkich jego przodków w kolejności topologicznej: 
@@ -143,13 +169,42 @@ function backward!(order::Vector{GraphNode}; seed=1)
         n isa Operator || continue # Pominięcie liści, które nie produkują gradientu (nie są operatorami) dla innych węzłów (nie mają wejść)
         n.gradient === nothing && continue # Pominięcie operatorów, które jeszcze nie otrzymały gradientu (gałąź odcięta od "root")
         in_values = ntuple(i -> n.inputs[i].output, length(n.inputs)) # wartości wejść z forward (potrzebne do liczenia gradientu lokalnego)
-        in_grads = backward(n, in_values..., n.gradient) # reguła łańcuchowa: wybieranie metody po typie operatora "backward(n, ...)"
+        # Najpierw próba jądra in-place (P1/B4): pisze gradienty bezpośrednio do buforów wejść.
+        backward!(n, in_values..., n.gradient) === true && continue # obsłużone - bez tablic pośrednich
+        in_grads = backward(n, in_values..., n.gradient) # ścieżka klasyczna: reguła łańcuchowa po typie operatora
         # zwraca krotkę "(g_in1, g_in2, ...)" - po jednym elemencie na każde wejście
         for (inp, g) in zip(n.inputs, in_grads) # gradienty do wejść operatora
-            _accumulate!(inp, g) # "+=" z obsługą "nothing" (np. stałych wejść, które nie uczestniczą w automatycznym różniczkowaniu)
+            _accumulate!(inp, g) # akumulacja do bufora własnego wejścia (kopia przy pierwszym wkładzie)
         end
     end
     return nothing
+end
+
+# Protokół jąder backward in-place (P1/B4):
+# "backward!(n, wejścia..., g)" pisze gradienty bezpośrednio do buforów węzłów-wejść
+# i zwraca "true"; zwrot "false" kieruje na ścieżkę klasyczną ("backward" + "_accumulate!").
+backward!(n::Operator, args...) = false # wariant domyślny: brak jądra in-place
+
+# Cel akumulacji dla jądra in-place: bufor gradientu wejścia "inp" o typie "T" i kształcie "dims".
+# Zwraca "nothing" dla Constant (gradient liścia nietrenowalnego jest zbędny - jądro może
+# pominąć jego liczenie) albo krotkę "(bufor, seeded)":
+#   seeded = false -> pierwszy wkład: bufor należy NADPISAĆ,
+#   seeded = true  -> kolejny wkład: należy DOSUMOWAĆ.
+_grad_target!(::Constant, ::Type{T}, dims::Dims) where {T} = nothing
+function _grad_target!(inp::Variable, ::Type{T}, dims::Dims) where {T}
+    g = inp.gradient
+    g isa AbstractArray && size(g) == dims && return (g, true) # bufor wyzerowany w "zerograd!" - dosumowanie
+    buf = Array{T}(undef, dims) # stan nietypowy (przed "zerograd!") - świeży bufor
+    inp.gradient = buf
+    return (buf, false)
+end
+function _grad_target!(inp::Operator, ::Type{T}, dims::Dims) where {T}
+    g = inp.gradient
+    g isa AbstractArray && size(g) == dims && return (g, true) # kolejny wkład w tym przejściu
+    buf = _ensure(inp.gradbuf, T, dims) # pierwszy wkład: reużycie zachowanego bufora węzła
+    inp.gradbuf = buf
+    inp.gradient = buf
+    return (buf, false)
 end
 
 # Inicjalizacja gradientu korzenia przez dopasowanie kształtu:
@@ -183,13 +238,29 @@ function _accumulate!(n::Variable, g::NodeValue)
     return nothing
 end
 
-# Analogiczna akumulacja dla operatorów. Różni się od Variable tylko typem pola ".gradient"
-# (ten sam wzorzec logiki - ale typ pola ".gradient" jest inny: NodeValue).
+# Akumulacja dla operatorów - rozłączne bufory własne (P1/B4).
+# Pierwszy wkład gradientowy (od pierwszego konsumenta węzła) jest KOPIOWANY do
+# zachowanego bufora węzła ("gradbuf") zamiast zapisywany przez referencję - "g"
+# może współdzielić pamięć z innym węzłem
+# (operatory pass-through: "identity"/"flatten"/Dropout w eval zwracają "g" lub
+# "reshape(g)") albo z buforem roboczym warstwy (":gx" splotu/MaxPoola).
+# Dzięki kopii gradient węzła nigdy nie aliasuje cudzej pamięci, więc kolejne
+# wkłady można dosumowywać w miejscu (".+=") bez ryzyka uszkodzenia innych gradientów.
 function _accumulate!(n::Operator, g::NodeValue)
-    if n.gradient === nothing # nadpisanie pierwszego przychodzącego gradient
-        n.gradient = g
-    else
-        n.gradient = n.gradient .+ g  # sumowanie kolejnych gradientów po wyjściach operatora (wiele wyjść operatora = suma gradientów po nich)
+    if g isa AbstractArray
+        cur = n.gradient
+        if cur === nothing # pierwszy wkład w tym przejściu backward!
+            buf = _ensure(n.gradbuf, eltype(g), size(g)) # reużycie zachowanego bufora (alokacja tylko raz / przy zmianie kształtu)
+            copyto!(buf, g) # kopia odcina aliasing
+            n.gradbuf = buf
+            n.gradient = buf
+        elseif cur isa AbstractArray && size(cur) == size(g)
+            cur .+= g # kolejne wkłady w miejscu - bufor jest własnością wyłączną węzła
+        else
+            n.gradient = cur .+ g # przypadek brzegowy (niezgodny kształt)
+        end
+    else # gradient skalarny (np. węzeł straty)
+        n.gradient = n.gradient === nothing ? g : n.gradient + g
     end
     return nothing
 end
@@ -254,6 +325,23 @@ function forward!(out, ::BroadcastedOperator{typeof(*)}, A::AbstractMatrix, B::A
     o = _ensure(out, promote_type(eltype(A), eltype(B)), (size(A, 1), size(B, 2)))
     mul!(o, A, B) # BLAS bez tablicy pośredniej
     return o
+end
+
+# Mnożenie macierzowe - backward in-place (P1/B4): gradienty pisane wprost do buforów
+# wejść 5-argumentowym "mul!" (C = α·A*B + β·C), bez tablic pośrednich "g*Bᵀ"/"Aᵀ*g".
+# "seeded" jako β: false = nadpisanie bufora (pierwszy wkład), true = dosumowanie.
+function backward!(n::BroadcastedOperator{typeof(*)}, A::AbstractMatrix, B::AbstractMatrix, g::AbstractMatrix)
+    tA = _grad_target!(n.inputs[1], promote_type(eltype(g), eltype(B)), (size(A, 1), size(A, 2)))
+    if tA !== nothing # "nothing" = wejście Constant (gradient zbędny)
+        bufA, seededA = tA
+        mul!(bufA, g, B', true, seededA) # dL/dA = g*Bᵀ
+    end
+    tB = _grad_target!(n.inputs[2], promote_type(eltype(A), eltype(g)), (size(B, 1), size(B, 2)))
+    if tB !== nothing
+        bufB, seededB = tB
+        mul!(bufB, A', g, true, seededB) # dL/dB = Aᵀ*g
+    end
+    return true # gradienty zapisane - ścieżka klasyczna pomijana
 end
 
 # ReLU (każdego elementu)
@@ -431,9 +519,10 @@ end
 
 # Rozrzuca (scatter-add) gradient okien "gcols (K, N)" z powrotem do kształtu wejścia "gx".
 # Operacja odwrotna do "_im2col!"; "+=" bo jedna pozycja wejścia należy do wielu okien.
-function _col2im!(gx::AbstractArray{T,4}, gcols::AbstractMatrix, kH, kW, sH, sW, pH, pW, H_out, W_out) where {T}
+# "seeded=true" (P1/B4) pomija zerowanie - wkłady dosumowywane do istniejącego gradientu.
+function _col2im!(gx::AbstractArray{T,4}, gcols::AbstractMatrix, kH, kW, sH, sW, pH, pW, H_out, W_out, seeded::Bool = false) where {T}
     H, Wd, Cin, B = size(gx) # rozmiary wejścia (cel rozrzucania)
-    fill!(gx, zero(T)) # start od zer - wkłady są akumulowane
+    seeded || fill!(gx, zero(T)) # start od zer (pierwszy wkład) - wkłady są akumulowane
     @inbounds for b = 1:B, w = 1:W_out, h = 1:H_out # ta sama kolejność iteracji co w "_im2col!"
         col = h + (w - 1) * H_out + (b - 1) * H_out * W_out
         row = 0
@@ -539,6 +628,58 @@ function backward(::BroadcastedOperator{typeof(conv_op)}, c, x, W, g)
     return (nothing, gx, gW)   # krotka po KOLEJNOŚCI wejść: (g_c, g_x, g_W); "c" jest Constant -> nic nie zwraca
 end
 
+# Unflip z akumulacją: przepisuje "gWm (K, Cout)" do bufora jądra "Wbuf" odwracając
+# flip z "_kernel2mat!". Osobna funkcja = bariera funkcyjna: bufor z "_grad_target!"
+# ma typ abstrakcyjny, a tu specjalizuje się do konkretnego typu (bez boxingu w pętli).
+function _unflip_acc!(Wbuf::AbstractArray{T,4}, gWm::AbstractMatrix, seeded::Bool) where {T}
+    seeded || fill!(Wbuf, zero(T)) # pierwszy wkład - bufor zaczyna od zer
+    kH, kW, Cin, Cout = size(Wbuf)
+    @inbounds for cout = 1:Cout, cin = 1:Cin, kw = 1:kW, kh = 1:kH
+        Wbuf[kH + 1 - kh, kW + 1 - kw, cin, cout] += gWm[kh + (kw - 1) * kH + (cin - 1) * kH * kW, cout] # unflip + dosumowanie
+    end
+    return Wbuf
+end
+
+# Splot - backward in-place (P1/B4): gradienty pisane bezpośrednio do buforów węzłów.
+# dL/dW jest dosumowywane do bufora Variable (unflip z "gWm" w pętli), a dL/dx
+# rozrzucane przez "_col2im!" wprost do bufora węzła wejściowego. Gdy wejście "x"
+# jest liściem Constant (np. obrazy pierwszej warstwy), gradient po "x" jest
+# POMIJANY w całości - oszczędza to GEMM "gcols" i całe "_col2im!".
+function _conv_backward_into!(n, c, x::AbstractArray{Tx,4}, W::AbstractArray{Tw,4}, g::AbstractArray{Tg,4}) where {Tx, Tw, Tg}
+    pH, pW = c.pad # margines
+    sH, sW = c.stride # krok
+    kH, kW, Cin, Cout = size(W) # rozmiary jądra
+    H_out, W_out, _, _ = size(g) # rozmiary gradientu wyjścia
+    T = promote_type(Tx, Tw, Tg) # wspólny typ obliczeń pośrednich
+    K = kH * kW * Cin
+    N = H_out * W_out * size(x, 4)
+    cols = _fit!(c.ws, :cols, T, (K, N)) # okna wejścia (jak w forward)
+    _im2col!(cols, x, kH, kW, sH, sW, pH, pW, H_out, W_out)
+    G = _fit!(c.ws, :G, T, (N, Cout)) # gradient wyjścia w układzie "(pozycja, kanał)"
+    permutedims!(reshape(G, H_out, W_out, size(x, 4), Cout), g, (1, 2, 4, 3))
+    # dL/dW: GEMM do bufora roboczego, potem unflip z akumulacją do bufora węzła wag
+    gWm = _fit!(c.ws, :gWm, T, (K, Cout))
+    mul!(gWm, cols, G) # GEMM: (K, N) * (N, Cout)
+    tW = _grad_target!(n.inputs[3], Tw, size(W))
+    if tW !== nothing
+        Wbuf, seededW = tW
+        _unflip_acc!(Wbuf, gWm, seededW) # bariera funkcyjna - pętla specjalizowana po typie bufora
+    end
+    # dL/dx: liczony tylko, gdy wejście potrzebuje gradientu (nie jest Constant)
+    tx = _grad_target!(n.inputs[2], Tx, size(x))
+    if tx !== nothing
+        Wm = _fit!(c.ws, :Wm, Tw, (K, Cout))
+        _kernel2mat!(Wm, W)
+        gcols = _fit!(c.ws, :gcols, T, (K, N))
+        mul!(gcols, Wm, transpose(G)) # GEMM: (K, Cout) * (Cout, N)
+        gxbuf, seededx = tx
+        _col2im!(gxbuf, gcols, kH, kW, sH, sW, pH, pW, H_out, W_out, seededx) # scatter-add wprost do bufora węzła
+    end
+    return true
+end
+backward!(n::BroadcastedOperator{typeof(conv_op)}, c, x::AbstractArray{<:Real,4}, W::AbstractArray{<:Real,4}, g::AbstractArray{<:Real,4}) =
+    _conv_backward_into!(n, c, x, W, g) # wariant bez biasu
+
 # Wariant Z biasem:
 # 4 wejścia (config, x, W, b)
 forward(::BroadcastedOperator{typeof(conv_op)}, c, x, W, b) =
@@ -556,6 +697,16 @@ function backward(::BroadcastedOperator{typeof(conv_op)}, c, x, W, b, g)
     gb = reshape([sum(@view g[:, :, cout, :]) for cout in 1:Cout], size(b)) # sumuje "g" po (H_out, W_out, B) dla każdego "cout"; reshape dopasowuje do oryginalnego size(b)
     #@view powoduje, że sumuje gradient po (H_out, W_out, B) bez kopiowania całego bloku g[:, :, cout, :] (oszczędza pamięć)
     return (nothing, gx, gW, gb) # (g_config, g_x, g_Weights, g_bias)
+end
+
+# Wariant Z biasem - backward in-place (P1/B4): gradienty x/W jak w wariancie bez biasu,
+# dL/db sumowane per kanał i akumulowane klasycznie (tablica rzędu C_out - pomijalna).
+function backward!(n::BroadcastedOperator{typeof(conv_op)}, c, x::AbstractArray{<:Real,4}, W::AbstractArray{<:Real,4}, b, g::AbstractArray{<:Real,4})
+    _conv_backward_into!(n, c, x, W, g) # gradienty po x i W wprost do buforów węzłów
+    Cout = size(g, 3)
+    gb = reshape([sum(@view g[:, :, cout, :]) for cout in 1:Cout], size(b)) # dL/db[cout] = suma po (H_out, W_out, B)
+    _accumulate!(n.inputs[4], gb) # akumulacja do bufora Variable biasu
+    return true
 end
 
 # MaxPool 2D
@@ -599,16 +750,15 @@ _maxpool_forward(m, x) = _maxpool_forward!(nothing, m, x) # wariant alokujący (
 # (reguła łańcuchowa dla max: pochodna po zwycięskim argumencie = 1, reszta = 0).
 # W przypadku remisu trafia do pierwszej znalezionej pozycji (drobna niestabilność gradientu na patologicznych wejściach)
 
-function _maxpool_backward(m, x::AbstractArray{T,4}, g::AbstractArray{Tg,4}) where {T, Tg}
+# Rdzeń backward MaxPoola: scatter gradientu do wskazanego bufora "gx".
+# "seeded=true" (P1/B4) pomija zerowanie - wkłady dosumowywane do istniejącego gradientu.
+function _maxpool_backward_into!(gx::AbstractArray{T,4}, m, x::AbstractArray{T,4}, g::AbstractArray{Tg,4}, seeded::Bool = false) where {T, Tg}
     kH, kW = m.pool # rozmiar okna per wymiar
     sH, sW = m.stride # krok per wymiar
     pH, pW = m.pad # padding per wymiar
     H, Wd, C, B = size(x) # rozmiary wejścia (przestrzenne, kanały, batch)
     H_out, W_out, _, _ = size(g) # rozmiary gradientu wyjścia (odpowiada kształtowi y z forwarda)
-    # Optymalizacja P1: bufor ":gx" z przestrzeni roboczej warstwy (reużywany między
-    # iteracjami); czytany tylko w obrębie jednego przejścia backward!, więc reużycie jest bezpieczne.
-    gx = _fit!(m.ws, :gx, T, size(x))
-    fill!(gx, zero(T)) # start od zer; wkłady tylko do pozycji argmax (wygrywających max)
+    seeded || fill!(gx, zero(T)) # start od zer (pierwszy wkład); wkłady tylko do pozycji argmax (wygrywających max)
     # argmax jest liczony "w locie" (drugi raz) zamiast pamiętać go z forwarda.
     # To oszczędza pamięć; narzut CPU przy standardowych oknach (2 x 2) jest pomijalny.
     @inbounds for b = 1:B, c = 1:C, h = 1:H_out, w = 1:W_out # pętla po wszystkich pozycjach wyjścia
@@ -627,6 +777,14 @@ function _maxpool_backward(m, x::AbstractArray{T,4}, g::AbstractArray{Tg,4}) whe
         # przekazanie całego gradientu tylko do zwycięzcy okna (reguła łańcuchowa):
         bhi > 0 && (gx[bhi, bwi, c, b] += g[h, w, c, b]) # "+=" bo ta pozycja mogła wygrać w wielu oknach
     end
+    return gx
+end
+
+# Wariant klasyczny: bufor ":gx" z przestrzeni roboczej warstwy (reużywany między
+# iteracjami); czytany tylko w obrębie jednego przejścia backward!, więc reużycie jest bezpieczne.
+function _maxpool_backward(m, x::AbstractArray{T,4}, g::AbstractArray{Tg,4}) where {T, Tg}
+    gx = _fit!(m.ws, :gx, T, size(x))
+    _maxpool_backward_into!(gx, m, x, g)
     return (gx,) # krotka jednoelementowa (dla spójności API z innymi operatorami)
 end
 
@@ -636,6 +794,17 @@ forward!(out, ::BroadcastedOperator{typeof(maxpool_op)}, m, x) = _maxpool_forwar
 function backward(::BroadcastedOperator{typeof(maxpool_op)}, m, x, g)
     gx, = _maxpool_backward(m, x, g) # rozpakowanie krotki 1-el.
     return (nothing, gx) # po kolejności: (g_m, g_x); "m" jest Constantem -> nothing
+end
+
+# MaxPool - backward in-place (P1/B4): scatter gradientu wprost do bufora węzła
+# wejściowego (bez bufora pośredniego ":gx" i bez kopii przy akumulacji).
+function backward!(n::BroadcastedOperator{typeof(maxpool_op)}, m, x::AbstractArray{T,4}, g::AbstractArray{<:Real,4}) where {T}
+    tx = _grad_target!(n.inputs[2], T, size(x))
+    if tx !== nothing # "nothing" = wejście Constant (gradient zbędny)
+        gxbuf, seeded = tx
+        _maxpool_backward_into!(gxbuf, m, x, g, seeded)
+    end
+    return true
 end
 
 # Flatten

@@ -3,6 +3,20 @@
 # Pola "output"/"gradient" są typu "Union{Nothing, T}" – pozwala to startować od "nothing"
 # i później (podczas "forward!"/"backward!") wpisać wartość typu T bez użycia "Any".
 
+# Słownik pojęć (uczenie maszynowe) - pierwsze wystąpienia w tym pliku:
+# - batch (paczka)       - grupa próbek przetwarzanych łącznie w jednym kroku; w tensorach zajmuje
+#                          ostatni wymiar (oś batcha); "batchsize" = liczba próbek w paczce.
+# - bias                 - wyraz wolny warstwy, dodawany do wyniku liniowego: y = W*x + b.
+# - jądro / filtr        - mała macierz wag splotu (np. 3x3) przesuwana po obrazie; uczony detektor wzorca.
+# - kanały (channels)    - liczba "warstw" wartości na piksel (1 = skala szarości; po splocie = liczba map cech).
+# - stride (krok)        - co ile pozycji przesuwane jest okno splotu/poolingu.
+# - padding (margines)   - wirtualne zera dokładane wokół wejścia w celu kontroli rozmiaru wyjścia.
+# - pooling (MaxPool)    - redukcja rozdzielczości map cech: z każdego okna zostaje wartość maksymalna.
+# - flatten              - spłaszczenie tensora do macierzy "(cechy, batch)" przed warstwą gęstą (Dense).
+# - dropout              - regularyzacja: losowe zerowanie części aktywacji podczas treningu
+#                          (maska = tablica true/false wskazująca zachowane elementy).
+# - embedding (osadzenie)- mapowanie indeksów dyskretnych (np. słów) na gęste wektory liczb.
+
 # Graph obliczeniowy
 
 abstract type GraphNode end
@@ -34,9 +48,10 @@ mutable struct ScalarOperator{F, T<:Real, G<:Real} <: Operator
     inputs::NTuple{2, GraphNode} # dokładnie dwa węzły-wejścia (dowolnego podtypu "GraphNode")
     output::Union{Nothing, T} # skalarny wynik "forward"; "nothing" dopóki nie zawołano "forward!"
     gradient::Union{Nothing, G} # skalarny gradient po "backward!"; "nothing" na starcie i po "zerograd!"
+    gradbuf::Union{Nothing, G} # zachowany bufor gradientu (P1/B4); reużywany między przejściami backward!
     name::String # etykieta diagnostyczna (np. "sop" - scalar operator)
 end
-ScalarOperator(fun::F, inputs::NTuple{2, GraphNode}; name::AbstractString="?") where {F} = ScalarOperator{F, Real, Real}(inputs, nothing, nothing, String(name)) # Operator o funkcji "fun" i dwóch wejściach "inputs" i nazwie "name".
+ScalarOperator(fun::F, inputs::NTuple{2, GraphNode}; name::AbstractString="?") where {F} = ScalarOperator{F, Real, Real}(inputs, nothing, nothing, nothing, String(name)) # Operator o funkcji "fun" i dwóch wejściach "inputs" i nazwie "name".
 
 # Operator z dowolną liczbą wejść (operacje element-wise, "*", "+", redukcje):
 # 1 wejście - BroadcastedOperator(relu, x), BroadcastedOperator(sum, x), BroadcastedOperator(flatten_op, x)
@@ -48,9 +63,10 @@ mutable struct BroadcastedOperator{F, T<:NodeValue, G<:NodeValue} <: Operator
     inputs::Tuple{Vararg{GraphNode}} # dowolna liczba węzłów-wejść (krotność wymuszona dopiero przez metody "forward"/"backward")
     output::Union{Nothing, T} # wynik "forward" (tablica lub skalar); "nothing" przed "forward!"
     gradient::Union{Nothing, G} # zakumulowany gradient po "backward!"; "nothing" na starcie i po "zerograd!"
+    gradbuf::Union{Nothing, G} # zachowany bufor gradientu (P1/B4); własność wyłączna węzła, reużywany między przejściami backward! (gradient nigdy nie współdzieli pamięci z innym węzłem)
     name::String # etykieta diagnostyczna (np. "W*x+b" - mnożenie macierzowe, "conv+b" - konwolucja z biasem, "bce" - binary cross-entropy)
 end
-BroadcastedOperator(fun::F, inputs::Vararg{GraphNode}; name::AbstractString="?") where {F} = BroadcastedOperator{F, NodeValue, NodeValue}(inputs, nothing, nothing, String(name)) # Operator o funkcji "fun" i dowolnej liczbie wejściach "inputs" i nazwie "name".
+BroadcastedOperator(fun::F, inputs::Vararg{GraphNode}; name::AbstractString="?") where {F} = BroadcastedOperator{F, NodeValue, NodeValue}(inputs, nothing, nothing, nothing, String(name)) # Operator o funkcji "fun" i dowolnej liczbie wejściach "inputs" i nazwie "name".
 
 # Przestrzeń robocza warstwy (optymalizacja P1):
 # bufory wielokrotnego użytku między iteracjami treningu (np. macierze im2col, gradienty wejść).

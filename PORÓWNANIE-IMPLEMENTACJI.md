@@ -257,8 +257,12 @@ bez mapowania na graf), `ScalarOperator` (nieużywany w ścieżce CNN), `bce`/`b
 > - krok **P1 (preałokacja buforów + operacje in-place, B3/B5) zrealizowany** —
 >   zob. `OPTYMALIZACJA-P1-PREALOKACJA.md` (alokacje epoki 25.3 GiB → 2.38 GiB,
 >   krok treningowy 4.23 MiB → 323 KiB, czas epoki ~14.8 s, identyczna trajektoria
->   uczenia). Akumulacja in-place objęła na razie wyłącznie `Variable`
->   (bufor własny, brak aliasingu); akumulacja operatorów — następny krok P1.
+>   uczenia),
+> - krok **P1 (akumulacja gradientu in-place, B4) zrealizowany** — zob.
+>   `OPTYMALIZACJA-P1-AKUMULACJA.md` (rozłączne bufory gradientów `gradbuf` —
+>   aliasing z 6.5 usunięty; protokół jąder `backward!` in-place dla `*`, splotu
+>   i MaxPoola; pominięcie gradientu wejść `Constant`; backward 317 KiB → 17 KiB,
+>   epoka ~12.1 s / 680 MiB, identyczna trajektoria uczenia).
 
 
 | Prio   | Krok                                                                                                                                                                                 | Gdzie                                    | Oczekiwany efekt                                              | Nakład      |
@@ -283,17 +287,18 @@ bez mapowania na graf), `ScalarOperator` (nieużywany w ścieżce CNN), `bce`/`b
 `forward!`/`backward!`/`optimize!`) muszą działać bez zmian w notatniku.
 - **Współdzielenie pamięci** `Variable` ↔ tablice warstw (warunek działania `optimize!` in-place).
 - **Determinizm Dropoutu** — backward musi używać tej samej maski co forward (zob. B-cache).
-- **⚠ Aliasing gradientów (pułapka przy przejściu na in-place)** — obecnie kilka
-  operatorów zwraca w `backward` gradient **współdzielący pamięć** z gradientem
-  wejściowym: `identity` zwraca `g`, `flatten` zwraca `reshape(g, …)` (ta sama
-  pamięć), pass-through Dropoutu zwraca `g`. Jednocześnie pierwsza akumulacja
-  w `_accumulate!(::Operator, g)` zapisuje **referencję bez kopii**
-  (`n.gradient = g`). Działa to tylko dlatego, że dzisiejsza akumulacja
-  (`n.gradient .+ g`) alokuje nową tablicę. Naiwna zamiana na `.+=` zacznie
-  modyfikować gradient cudzego węzła i **cicho zepsuje wyniki** — przed P1
-  trzeba albo kopiować w operatorach pass-through, albo dać każdemu węzłowi
-  rozłączny, preałokowany bufor gradientu. Analogicznie `forward` `identity`
-  zwraca `x`, a `flatten` — `reshape(x, …)`: wyjścia tych węzłów aliasują wejścia.
+- **Aliasing gradientów — ✅ ROZWIĄZANE w kroku B4** (`OPTYMALIZACJA-P1-AKUMULACJA.md`).
+  Historycznie: operatory pass-through (`identity`, `flatten`, Dropout w eval)
+  zwracały w `backward` gradient współdzielący pamięć z gradientem wejściowym,
+  a pierwsza akumulacja zapisywała referencję bez kopii — naiwne `.+=` psułoby
+  wyniki. Od kroku B4 każdy operator ma **rozłączny, zachowany bufor**
+  (`gradbuf`): pierwszy wkład jest kopiowany, kolejne dosumowywane w miejscu;
+  jądra in-place piszą wyłącznie do buforów uzyskanych z `_grad_target!`.
+  Niezmiennik do utrzymania w przyszłych krokach: gradient węzła nigdy nie
+  współdzieli pamięci z innym węzłem ani z buforami `Workspace` warstw.
+  Uwaga: wyjścia `forward` operatorów `identity`/`flatten` nadal aliasują
+  wejścia (`x`/`reshape(x)`) — to celowe (zero kopii) i bezpieczne, bo wyjścia
+  nie są modyfikowane w miejscu poza właścicielem bufora.
 
 ### 6.6. Jak weryfikować postęp
 

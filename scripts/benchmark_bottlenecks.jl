@@ -95,6 +95,48 @@ if HAS_NAIVE
     println("  OK - wyniki zgodne")
 end
 
+# Poprawność pełnej ścieżki grafu (jądra in-place backward! + akumulacja, P1/B4):
+# gradient numeryczny (centralne różnice) porównany z gradientami Variable po backward!.
+# Sieć bez Dropoutu (losowa maska uniemożliwia różnice skończone) i w Float64.
+
+println("\n[Poprawnosc] gradienty na pelnym grafie (sciezka in-place backward!)")
+let
+    Random.seed!(7)
+    netv = Chain(
+        Conv((3, 3), 1 => 2, pad = 1, bias = true, T = Float64), # bias=true - pokrywa wariant backward! z biasem
+        MaxPool((2, 2)),
+        flatten,
+        Dense(32 => 5, relu; T = Float64),
+        Dense(5 => 3; T = Float64),
+    )
+    xs = randn(Float64, 8, 8, 1, 4)
+    ys = zeros(Float64, 3, 4); for j in 1:4; ys[rand(1:3), j] = 1.0; end
+    inp = Constant(copy(xs)); tgt = Constant(ys)
+    L = AWIDNN.logitcrossentropy(netv(inp), tgt)
+    gg = graph(L)
+    forward!(gg) # pierwszy przebieg alokuje bufory; kolejne idą ścieżką in-place
+    forward!(gg); backward!(gg)
+    eps = 1e-6
+    maxrel = 0.0
+    for v in gg # sprawdzenie losowego elementu każdego parametru (wagi + biasy)
+        v isa Variable || continue
+        length(v.output) == 0 && continue
+        idx = rand(CartesianIndices(v.output))
+        orig = v.output[idx]
+        v.output[idx] = orig + eps; Lp = forward!(gg) # strata po perturbacji +eps
+        v.output[idx] = orig - eps; Lm = forward!(gg) # strata po perturbacji -eps
+        v.output[idx] = orig
+        num = (Lp - Lm) / (2 * eps) # pochodna numeryczna (centralna)
+        ana = v.gradient[idx] # pochodna analityczna z backward!
+        rel = abs(num - ana) / max(abs(num), abs(ana), 1e-12)
+        maxrel = max(maxrel, rel)
+        println("  ", rpad(v.name, 8), " analityczny = ", round(ana, sigdigits = 8),
+                ", numeryczny = ", round(num, sigdigits = 8))
+    end
+    @assert maxrel < 1e-5 "gradient grafu: rozjazd wzgledny $maxrel"
+    println("  OK - max wzgledna roznica = ", round(maxrel, sigdigits = 3))
+end
+
 # B2-B5 - pełny krok treningowy na grafie (dispatch, alokacje forward/backward/zerograd)
 
 println("\n[B2-B5] Pelny krok treningowy: forward! + backward! + optimize!")
