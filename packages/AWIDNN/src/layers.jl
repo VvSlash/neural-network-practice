@@ -109,14 +109,14 @@ function Conv(kernel::Tuple{Int,Int}, pair::Pair{<:Integer,<:Integer}; pad::Unio
     b = bias ? zeros(T, cout, 1) : zeros(T, 0, 1) # gdy bias=false to trzyma pustą tablicę (upraszcza typ)
     _s = stride isa Integer ? (Int(stride), Int(stride)) : (Int(stride[1]), Int(stride[2])) # normalizacja kroku splotu do NTuple{2,Int}
     _p = pad isa Integer ? (Int(pad), Int(pad)) : (Int(pad[1]), Int(pad[2])) # normalizacja padding do NTuple{2,Int}
-    return Conv{T, typeof(w), typeof(b), typeof(σ)}(w, b, σ, _s, _p) # jawna konstrukcja typu dla poprawnego wnioskowania typów przez kompilator (wagi, bias, aktywacja, krok splotu, padding, typ)
+    return Conv{T, typeof(w), typeof(b), typeof(σ)}(w, b, σ, _s, _p, Workspace()) # jawna konstrukcja typu dla poprawnego wnioskowania typów przez kompilator; "Workspace()" = puste bufory robocze (P1)
 end
 
 # MaxPool - konstruktor
 # Domyślnie "stride = pool" (niezachodzące okna), "pad = 0".
 function MaxPool(pool::NTuple{N,Int}; stride::NTuple{N,Int} = pool,
                  pad::NTuple{N,Int} = ntuple(_ -> 0, N)) where {N}
-    return MaxPool{N}(pool, stride, pad) # wrapper utrzymujący API spójne z Flux
+    return MaxPool{N}(pool, stride, pad, Workspace()) # wrapper utrzymujący API spójne z Flux; "Workspace()" = bufory robocze (P1)
 end
 
 # Funkcja (c::Conv)(x::GraphNode) buduje w grafie operację konwolucji 2D:

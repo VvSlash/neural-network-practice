@@ -251,6 +251,15 @@ bez mapowania na graf), `ScalarOperator` (nieużywany w ścieżce CNN), `bce`/`b
 
 ### 6.4. Rekomendowane kroki (priorytetyzowane)
 
+> **Status**:
+> - krok **P0 (im2col + GEMM) zrealizowany** — zob. `OPTYMALIZACJA-P0-IM2COL.md`
+>   (czas epoki ~150–190 s → ~16 s, test acc 87.5%),
+> - krok **P1 (preałokacja buforów + operacje in-place, B3/B5) zrealizowany** —
+>   zob. `OPTYMALIZACJA-P1-PREALOKACJA.md` (alokacje epoki 25.3 GiB → 2.38 GiB,
+>   krok treningowy 4.23 MiB → 323 KiB, czas epoki ~14.8 s, identyczna trajektoria
+>   uczenia). Akumulacja in-place objęła na razie wyłącznie `Variable`
+>   (bufor własny, brak aliasingu); akumulacja operatorów — następny krok P1.
+
 
 | Prio   | Krok                                                                                                                                                                                 | Gdzie                                    | Oczekiwany efekt                                              | Nakład      |
 | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------- | ------------------------------------------------------------- | ----------- |

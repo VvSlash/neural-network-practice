@@ -52,6 +52,15 @@ mutable struct BroadcastedOperator{F, T<:NodeValue, G<:NodeValue} <: Operator
 end
 BroadcastedOperator(fun::F, inputs::Vararg{GraphNode}; name::AbstractString="?") where {F} = BroadcastedOperator{F, NodeValue, NodeValue}(inputs, nothing, nothing, String(name)) # Operator o funkcji "fun" i dowolnej liczbie wejściach "inputs" i nazwie "name".
 
+# Przestrzeń robocza warstwy (optymalizacja P1):
+# bufory wielokrotnego użytku między iteracjami treningu (np. macierze im2col, gradienty wejść).
+# Mapa "rola -> tablica"; bufor jest pozyskiwany przez "_fit!" w "autodiff.jl"
+# i realokowany tylko przy zmianie kształtu/typu (np. inny batchsize w ewaluacji).
+struct Workspace
+    bufs::Dict{Symbol, Array} # bufor per rola (":cols", ":gx", ...); konkretny typ przywracany asercją przy odczycie
+end
+Workspace() = Workspace(Dict{Symbol, Array}())
+
 # Warstwy i Chain
 
 # Sekwencja warstw. "Chain(l1, l2, ...)" lub "Chain((l1, l2, ...))"
@@ -79,6 +88,7 @@ struct Conv{T<:Real, W<:AbstractArray{T, 4}, B<:AbstractVecOrMat{T}, F}
     σ::F # aktywacja stosowana po konwolucji (np. "relu", "identity")
     stride::NTuple{2, Int} # krok splotu "(sH, sW)" – osobno dla wysokości i szerokości
     pad::NTuple{2, Int} # padding (symetryczny) "(pH, pW)" – osobno dla wysokości i szerokości
+    ws::Workspace # bufory robocze splotu (im2col, GEMM, gradienty) współdzielone między iteracjami
 end
 
 # Pooling maksymalizujący.
@@ -86,6 +96,7 @@ struct MaxPool{N}
     pool::NTuple{N, Int} # rozmiar okna w każdym z "N" wymiarów przestrzennych (np. "(height, width)")
     stride::NTuple{N, Int} # krok okna per-wymiar; domyślnie równy "pool"
     pad::NTuple{N, Int} # padding per-wymiar; poza brzegiem traktowany jak "-Inf"
+    ws::Workspace # bufor roboczy gradientu wejścia (":gx") współdzielony między iteracjami
 end
 
 # Spłaszczenie (height, width, channels, batch) -> (height*width*channels, batch).
@@ -98,8 +109,9 @@ mutable struct Dropout
     p::Float32 # prawdopodobieństwo wyzerowania pojedynczego elementu (0..1)
     active::Bool # "true" = trening (losowanie + skalowanie), "false" = ewaluacja (identyczność)
     mask::Union{Nothing, BitArray} # ostatnio wylosowana maska "rand(T, size(x)) .> p"; "nothing" przed forward lub w trybie eval
+    ws::Workspace # bufor roboczy losowania (":rand") współdzielony między iteracjami
 end
-Dropout(p::Real) = Dropout(Float32(p), true, nothing)
+Dropout(p::Real) = Dropout(Float32(p), true, nothing, Workspace())
 
 # DataLoader
 

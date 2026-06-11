@@ -1,5 +1,26 @@
 # src/autodiff.jl
 # Reverse-mode AD (autograd) na statycznym grafie obliczeniowym.
+
+using LinearAlgebra: mul! # mnożenie macierzowe in-place (BLAS) dla splotu im2col+GEMM
+using Random: rand! # losowanie w miejscu do istniejącego bufora (Dropout)
+
+# Pomocnicze zarządzanie buforami (optymalizacja P1):
+
+# Zwraca "out", jeśli pasuje typem i kształtem; w przeciwnym razie świeżą tablicę.
+# Pierwsze wywołanie jądra (out === nothing) zawsze alokuje; kolejne reużywają bufor.
+_ensure(out, ::Type{T}, dims::Dims{N}) where {T, N} =
+    (out isa Array{T, N} && size(out) == dims) ? out : Array{T, N}(undef, dims)
+
+# Pozyskuje z przestrzeni roboczej bufor o roli "key", typie "T" i kształcie "dims".
+# Realokacja tylko przy zmianie typu/kształtu (np. inny batchsize przy ewaluacji).
+function _fit!(ws::Workspace, key::Symbol, ::Type{T}, dims::Dims{N}) where {T, N}
+    buf = get(ws.bufs, key, nothing)
+    buf isa Array{T, N} && size(buf) == dims && return buf::Array{T, N} # trafienie - bufor pasuje
+    fresh = Array{T, N}(undef, dims) # nowy bufor (pierwsze użycie lub zmiana kształtu)
+    ws.bufs[key] = fresh
+    return fresh
+end
+
 # Idea: wyrażenie (np. strata L) jest reprezentowane jako skierowany graf acykliczny (ang. directed acyclic graph, DAG) węzłów.
 #   - liście: "Constant" (dane wejściowe, etykiety, konfiguracja warstw) i "Variable" (trenowalne parametry: wagi, biasy),
 #   - wewnętrzne węzły: "Operator" (ScalarOperator / BroadcastedOperator)
@@ -52,12 +73,21 @@ _compute!(::Variable) = nothing
 # Operator z dowolną liczbą wejść: zbiera wartości wszystkich wejść i
 # wywołuje metodę "forward(n, args...)", która jest wybierana po
 # "typeof(fun)" (np. "+", "*", "relu", "σ", "conv_op", itp. itd.).
+# Optymalizacja P1: pierwsze wywołanie alokuje wyjście przez "forward",
+# kolejne piszą w miejscu do istniejącego bufora "n.output" przez "forward!";
+# przy zmianie kształtu jądra in-place same realokują bufor ("_ensure").
 function _compute!(n::BroadcastedOperator)
     # "ntuple(f, N)" tworzy krotkę "(f(1), ..., f(N))"; tu zbiera ".output" z każdego wejścia.
-    # Rozpakowanie "..." rozwija krotkę na argumenty pozycyjne "forward".
-    n.output = forward(n, ntuple(i -> n.inputs[i].output, length(n.inputs))...) # zbiera wartości wejść i wywołuje metodę "forward(n, args...)" zgodnie z typem operatora
+    # Rozpakowanie "..." rozwija krotkę na argumenty pozycyjne "forward"/"forward!".
+    vals = ntuple(i -> n.inputs[i].output, length(n.inputs))
+    out = n.output
+    n.output = out === nothing ? forward(n, vals...) : forward!(out, n, vals...)
     return nothing
 end
+
+# Wariant domyślny "forward!": operator bez jądra in-place liczy jak dotychczas (alokując).
+# Jądra in-place dla gorących operatorów ("+", "*", "relu", "σ", conv, maxpool, dropout) niżej.
+forward!(out, n::BroadcastedOperator, vals...) = forward(n, vals...)
 
 # Operator skalarny ma dokładnie dwa wejścia - bez ntuple, prostsza wersja.
 function _compute!(n::ScalarOperator)
@@ -84,7 +114,17 @@ function zerograd!(order::Vector{GraphNode})
 end
 
 _zerograd!(::Constant) = nothing # Constant jest liściem nie-trenowalnym - nie ma gradientu
-_zerograd!(n::Variable) = (n.gradient = _zero_like(n.output); nothing)  # dla parametrów: start z zer w kształcie parametru (będzie akumulowany)
+# Dla parametrów: reużycie istniejącego bufora gradientu (fill! zamiast alokacji "zero(output)") - optymalizacja P1 (B5).
+# Bufor jest własnością wyłączną Variable (tworzony tu raz), więc zerowanie w miejscu jest bezpieczne.
+function _zerograd!(n::Variable)
+    g = n.gradient
+    if g isa AbstractArray
+        fill!(g, zero(eltype(g))) # zerowanie w miejscu - bez alokacji
+    else
+        n.gradient = _zero_like(n.output) # pierwsza iteracja (gradient === nothing) lub parametr skalarny
+    end
+    return nothing
+end
 _zerograd!(n::Operator) = (n.gradient = nothing; nothing) # dla operatorów: "nothing" = "gradient jeszcze nie przyszedł" (sygnał dla "_accumulate!")
 
 # Tworzenie "neutralnego" zera w typie i kształcie danej wartości.
@@ -127,12 +167,18 @@ _accumulate!(::Constant, _) = nothing # Constant nigdy nie dostaje gradientu
 _accumulate!(::Variable, ::Nothing) = nothing   # "nothing" = brak gradientu do dodania (pominięcie)
 _accumulate!(::Operator, ::Nothing) = nothing   # "nothing" = brak gradientu do dodania (pominięcie)
 
-# Akumulacja dla Variable (parametrów trenowalnych):
+# Akumulacja dla Variable (parametrów trenowalnych) - w miejscu (optymalizacja P1).
+# Bezpieczeństwo aliasingu: bufor "n.gradient" jest własnością wyłączną Variable
+# (tworzony w "zerograd!"), a "g" pochodzi ze świeżych lub roboczych tablic jąder
+# backward (np. "g*Bᵀ", bufor ":gW" splotu) - nigdy nie jest tym samym buforem.
 function _accumulate!(n::Variable, g::NodeValue)
-    if n.gradient === nothing # Dla pewności, bo "zerograd!" ustawia "zero(output)" dla Variable, więc g === nothing jest niemożliwe teraz (teoretycznie)
-        n.gradient = g # kopiowanie pierwszego otrzymanego gradientu
+    buf = n.gradient
+    if buf isa AbstractArray && g isa AbstractArray && size(buf) == size(g)
+        buf .+= g # sumowanie w miejscu do własnego bufora - bez alokacji
+    elseif buf === nothing
+        n.gradient = g # przypadek brzegowy: pierwszy gradient przed "zerograd!"
     else
-        n.gradient = n.gradient .+ g # sumowanie kolejnych gradientów po gałęziach grafu
+        n.gradient = buf .+ g # przypadek brzegowy: parametr skalarny lub niezgodny kształt
     end
     return nothing
 end
@@ -191,16 +237,45 @@ function backward(::BroadcastedOperator{typeof(+)}, a, b, g)
     return (_reduce_to(g, a), _reduce_to(g, b))
 end
 
+# Dodawanie w miejscu: wynik rozgłoszenia pisany do bufora "out" (P1).
+function forward!(out, ::BroadcastedOperator{typeof(+)}, a::AbstractArray, b::AbstractArray)
+    dims = map(length, Broadcast.combine_axes(a, b)) # kształt wyniku rozgłoszenia (np. macierz + bias)
+    o = _ensure(out, promote_type(eltype(a), eltype(b)), dims) # bufor wyjścia (realokacja tylko przy zmianie kształtu)
+    o .= a .+ b # zapis w miejscu - bez alokacji
+    return o
+end
+
 # Mnożenie macierzowe: y = A * B
 forward(::BroadcastedOperator{typeof(*)}, A, B) = A * B # samo "*" to mnożenie macierzy, a nie każdego elementu
 backward(::BroadcastedOperator{typeof(*)}, A, B, g) = (g * B', A' * g) # dL/dA = g*Bᵀ,  dL/dB = Aᵀ*g
+
+# Mnożenie macierzowe w miejscu: "mul!" (BLAS) pisze wprost do bufora "out" (P1).
+function forward!(out, ::BroadcastedOperator{typeof(*)}, A::AbstractMatrix, B::AbstractMatrix)
+    o = _ensure(out, promote_type(eltype(A), eltype(B)), (size(A, 1), size(B, 2)))
+    mul!(o, A, B) # BLAS bez tablicy pośredniej
+    return o
+end
 
 # ReLU (każdego elementu)
 forward(::BroadcastedOperator{typeof(relu)}, x) = max.(zero(eltype(x)), x) # "max.(0, x)" z zachowaniem typu elementu
 backward(::BroadcastedOperator{typeof(relu)}, x, g) = (g .* (x .> 0),) # dReLU/dx = 1 jeśli x>0 inaczej 0; "x .> 0" to BitArray - rzutowanie działa
 
+# ReLU w miejscu (P1).
+function forward!(out, ::BroadcastedOperator{typeof(relu)}, x::AbstractArray)
+    o = _ensure(out, eltype(x), size(x))
+    o .= max.(zero(eltype(x)), x)
+    return o
+end
+
 # Sigmoid: σ(x) = 1/(1+e^-x)
 forward(::BroadcastedOperator{typeof(σ)}, x) = one(eltype(x)) ./ (one(eltype(x)) .+ exp.(-x))
+
+# Sigmoid w miejscu (P1).
+function forward!(out, ::BroadcastedOperator{typeof(σ)}, x::AbstractArray)
+    o = _ensure(out, eltype(x), size(x))
+    o .= one(eltype(x)) ./ (one(eltype(x)) .+ exp.(-x))
+    return o
+end
 function backward(::BroadcastedOperator{typeof(σ)}, x, g)
     s = one(eltype(x)) ./ (one(eltype(x)) .+ exp.(-x)) # przeliczenie sigmoid(x) bo "forward" nie przekazuje wyniku
     return (g .* s .* (one(eltype(s)) .- s),) # dσ/dx = σ(x)*(1 − σ(x))
@@ -273,9 +348,10 @@ _reduce_to(g, ::Real) = sum(g) # skalarny "target" (suma wszystkich elementów)
 # W praktyce "Conv" zwraca "BroadcastedOperator(conv_op, …)".
 function conv_op end
 
-# Forward: ręczna implementacja splotu 4 zagnieżdżonych pętli.
-# We właściwej bibliotece powinno być "im2col + gemm" lub transformata FFT.
-function _conv_forward(c, x::AbstractArray{Tx,4}, W::AbstractArray{Tw,4}) where {Tx, Tw}
+# Implementacja referencyjna ("naive"): splot na 7 zagnieżdżonych pętlach.
+# Zachowana po optymalizacji P0 (im2col+GEMM poniżej) do testów poprawności
+# i benchmarków "przed/po" w "scripts/benchmark_bottlenecks.jl".
+function _conv_forward_naive(c, x::AbstractArray{Tx,4}, W::AbstractArray{Tw,4}) where {Tx, Tw}
     pH, pW = c.pad # margines per wymiar
     sH, sW = c.stride # krok per wymiar
     kH, kW, Cin, Cout = size(W) # rozmiary jądra i liczby kanałów (przesuwne okno / uczony detektor wzorca / filtr (np. 3 x 3))
@@ -298,9 +374,10 @@ function _conv_forward(c, x::AbstractArray{Tx,4}, W::AbstractArray{Tw,4}) where 
     return y
 end
 
-# Backward: jednoczesne dL/dx ("gx") i dL/dW ("gW")
+# Backward referencyjny ("naive"): jednoczesne dL/dx ("gx") i dL/dW ("gW")
 # ta sama pętla z gradientem "g" przychodzącym od wyjścia (z góry).
-function _conv_backward(c, x::AbstractArray{Tx,4}, W::AbstractArray{Tw,4}, g::AbstractArray{Tg,4}) where {Tx, Tw, Tg}
+# Zachowany po optymalizacji P0 - rola jak przy "_conv_forward_naive".
+function _conv_backward_naive(c, x::AbstractArray{Tx,4}, W::AbstractArray{Tw,4}, g::AbstractArray{Tg,4}) where {Tx, Tw, Tg}
     pH, pW = c.pad # margines
     sH, sW = c.stride # krok
     kH, kW, Cin, Cout = size(W) # rozmiary jądra
@@ -324,6 +401,129 @@ function _conv_backward(c, x::AbstractArray{Tx,4}, W::AbstractArray{Tw,4}, g::Ab
     return (gx, gW)
 end
 
+# Splot zoptymalizowany (P0): schemat im2col + GEMM.
+# Idea: splot zamieniany jest na jedno duże mnożenie macierzowe (BLAS):
+#   1. "im2col" rozkłada otoczenia (receptive fields) wejścia do macierzy "cols",
+#      gdzie kolumna = jedno okno splotu (jedna pozycja wyjścia),
+#   2. jądro po flipie jest spłaszczane do macierzy "(K, Cout)", K = kH*kW*Cin,
+#   3. wynik = "colsᵀ * Wm" liczony przez "mul!" (BLAS) zamiast pętli skalarnych.
+# Konwencje (flip jądra, padding zerowy, stride) identyczne jak w wariancie naive.
+
+# Linearyzacja indeksów (zgodna z układem column-major):
+#   wiersz "cols":   row = kh + (kw-1)*kH + (cin-1)*kH*kW          (kh najszybciej zmienne)
+#   kolumna "cols":  col = h + (w-1)*H_out + (b-1)*H_out*W_out     (h najszybciej zmienne)
+
+# Wypełnia macierz "cols (K, N)" oknami splotu; pozycje poza wejściem dostają 0 (padding).
+function _im2col!(cols::AbstractMatrix, x::AbstractArray{T,4}, kH, kW, sH, sW, pH, pW, H_out, W_out) where {T}
+    H, Wd, Cin, B = size(x) # rozmiary wejścia (przestrzenne, kanały, batch)
+    @inbounds for b = 1:B, w = 1:W_out, h = 1:H_out # jedna kolumna "cols" = jedno okno (h, w, b)
+        col = h + (w - 1) * H_out + (b - 1) * H_out * W_out # indeks kolumny ("h" najszybciej zmienne)
+        row = 0 # licznik wiersza; inkrementacja w kolejności (kh, kw, cin) - zgodnie z linearyzacją jądra
+        for cin = 1:Cin, kw = 1:kW, kh = 1:kH # "kh" w pętli wewnętrznej = zapis po kolejnych wierszach kolumny
+            row += 1
+            hi = (h - 1) * sH + kh - pH # pozycja w "x" w osi "height" (krok i margines jak w naive)
+            wi = (w - 1) * sW + kw - pW # pozycja w "x" w osi "width"
+            cols[row, col] = (1 <= hi <= H && 1 <= wi <= Wd) ? x[hi, wi, cin, b] : zero(T) # zero poza brzegiem = padding
+        end
+    end
+    return cols
+end
+
+# Rozrzuca (scatter-add) gradient okien "gcols (K, N)" z powrotem do kształtu wejścia "gx".
+# Operacja odwrotna do "_im2col!"; "+=" bo jedna pozycja wejścia należy do wielu okien.
+function _col2im!(gx::AbstractArray{T,4}, gcols::AbstractMatrix, kH, kW, sH, sW, pH, pW, H_out, W_out) where {T}
+    H, Wd, Cin, B = size(gx) # rozmiary wejścia (cel rozrzucania)
+    fill!(gx, zero(T)) # start od zer - wkłady są akumulowane
+    @inbounds for b = 1:B, w = 1:W_out, h = 1:H_out # ta sama kolejność iteracji co w "_im2col!"
+        col = h + (w - 1) * H_out + (b - 1) * H_out * W_out
+        row = 0
+        for cin = 1:Cin, kw = 1:kW, kh = 1:kH
+            row += 1
+            hi = (h - 1) * sH + kh - pH
+            wi = (w - 1) * sW + kw - pW
+            if 1 <= hi <= H && 1 <= wi <= Wd # pozycje paddingu nie wnoszą wkładu
+                gx[hi, wi, cin, b] += gcols[row, col] # suma po wszystkich oknach zawierających (hi, wi)
+            end
+        end
+    end
+    return gx
+end
+
+# Spłaszcza jądro z flipem do macierzy "(K, Cout)": Wm[row, cout] = W[kH+1-kh, kW+1-kw, cin, cout].
+# Flip zachowuje konwencję matematyczną splotu z wariantu naive (zgodną z Flux.Conv).
+function _kernel2mat!(Wm::AbstractMatrix, W::AbstractArray{Tw,4}) where {Tw}
+    kH, kW, Cin, Cout = size(W)
+    @inbounds for cout = 1:Cout, cin = 1:Cin, kw = 1:kW, kh = 1:kH
+        Wm[kh + (kw - 1) * kH + (cin - 1) * kH * kW, cout] = W[kH + 1 - kh, kW + 1 - kw, cin, cout] # flip indeksów (kh, kw)
+    end
+    return Wm
+end
+
+# Forward: y = colsᵀ * Wm przez BLAS, potem powrót do układu "(H_out, W_out, C_out, B)".
+# Optymalizacja P1: bufory pośrednie (":cols", ":Wm", ":Y") pochodzą z przestrzeni
+# roboczej warstwy "c.ws" i są reużywane między iteracjami; wynik pisany do "out"
+# (bufor węzła grafu) albo do świeżej tablicy, gdy "out === nothing" / kształt się zmienił.
+function _conv_forward!(out, c, x::AbstractArray{Tx,4}, W::AbstractArray{Tw,4}) where {Tx, Tw}
+    pH, pW = c.pad # margines per wymiar
+    sH, sW = c.stride # krok per wymiar
+    kH, kW, Cin, Cout = size(W) # rozmiary jądra i kanały
+    H, Wd, Cin2, B = size(x)
+    Cin == Cin2 || throw(DimensionMismatch("Conv: Cin z wag != Cin z wejścia")) # zgodność liczby kanałów
+    H_out = div(H  + 2pH - kH, sH) + 1 # rozmiar wyjścia w osi Height (formuła jak w naive)
+    W_out = div(Wd + 2pW - kW, sW) + 1 # rozmiar wyjścia w osi Width
+    T = promote_type(Tx, Tw) # wspólny typ obliczeń (np. Float32 x Float32 = Float32)
+    K = kH * kW * Cin # liczba elementów jednego okna splotu
+    N = H_out * W_out * B # liczba okien = liczba pozycji wyjścia
+    cols = _fit!(c.ws, :cols, T, (K, N)) # bufor okien (reużywany)
+    _im2col!(cols, x, kH, kW, sH, sW, pH, pW, H_out, W_out) # rozkład wejścia na okna
+    Wm = _fit!(c.ws, :Wm, Tw, (K, Cout)) # bufor macierzy jądra (reużywany)
+    _kernel2mat!(Wm, W) # jądro jako macierz "(K, Cout)" z flipem
+    Y = _fit!(c.ws, :Y, T, (N, Cout)) # wynik GEMM: wiersz = pozycja wyjścia (h, w, b), kolumna = kanał
+    mul!(Y, transpose(cols), Wm) # jedno mnożenie macierzowe (BLAS) zamiast 7 pętli
+    o = _ensure(out, T, (H_out, W_out, Cout, B)) # bufor wyjścia węzła
+    # "reshape (H_out, W_out, B, Cout)" odtwarza osie z linearyzacji kolumn; "permutedims!" przestawia w miejscu na "(H_out, W_out, C_out, B)"
+    permutedims!(o, reshape(Y, H_out, W_out, B, Cout), (1, 2, 4, 3))
+    return o
+end
+_conv_forward(c, x, W) = _conv_forward!(nothing, c, x, W) # wariant alokujący (pierwsze wywołanie / użycie poza grafem)
+
+# Backward: dL/dW i dL/dx jako dwa GEMM-y na tych samych macierzach "cols"/"Wm".
+#   gWm = cols * G   (K, Cout)  ->  unflip do kształtu jądra,
+#   gcols = Wm * Gᵀ  (K, N)     ->  "_col2im!" rozrzuca do "gx".
+# Optymalizacja P1: wszystkie tablice pośrednie oraz wyniki ("gx", "gW") pochodzą
+# z przestrzeni roboczej "c.ws". Zwracane "gx"/"gW" są nadpisywane przy KOLEJNYM
+# wywołaniu backward tej warstwy - są czytane tylko w obrębie jednego przejścia
+# backward! (akumulacja do Variable kopiuje wartości), więc reużycie jest bezpieczne.
+function _conv_backward(c, x::AbstractArray{Tx,4}, W::AbstractArray{Tw,4}, g::AbstractArray{Tg,4}) where {Tx, Tw, Tg}
+    pH, pW = c.pad # margines
+    sH, sW = c.stride # krok
+    kH, kW, Cin, Cout = size(W) # rozmiary jądra
+    H, Wd, _, B = size(x)
+    H_out, W_out, _, _ = size(g) # rozmiary gradientu wyjścia (kształt y z forwarda)
+    T = promote_type(Tx, Tw, Tg) # wspólny typ obliczeń pośrednich
+    K = kH * kW * Cin
+    N = H_out * W_out * B
+    cols = _fit!(c.ws, :cols, T, (K, N)) # te same okna co w forward (liczone ponownie - graf nie cache'uje)
+    _im2col!(cols, x, kH, kW, sH, sW, pH, pW, H_out, W_out)
+    G = _fit!(c.ws, :G, T, (N, Cout)) # gradient wyjścia w układzie "(pozycja, kanał)" - spójnym z "Y" z forwarda
+    permutedims!(reshape(G, H_out, W_out, B, Cout), g, (1, 2, 4, 3)) # "(H_out, W_out, C_out, B)" -> "(H_out, W_out, B, C_out)"
+    # dL/dWm: każda kolumna "cols" wniosła wkład do wiersza "G" -> suma iloczynów po oknach
+    gWm = _fit!(c.ws, :gWm, T, (K, Cout))
+    mul!(gWm, cols, G) # GEMM: (K, N) * (N, Cout)
+    gW = _fit!(c.ws, :gW, Tw, size(W)) # gradient jądra w oryginalnym kształcie (bufor reużywany)
+    @inbounds for cout = 1:Cout, cin = 1:Cin, kw = 1:kW, kh = 1:kH
+        gW[kH + 1 - kh, kW + 1 - kw, cin, cout] = gWm[kh + (kw - 1) * kH + (cin - 1) * kH * kW, cout] # unflip - odwrócenie "_kernel2mat!"
+    end
+    # dL/dcols: gradient każdego elementu okna = suma po kanałach wyjścia
+    Wm = _fit!(c.ws, :Wm, Tw, (K, Cout))
+    _kernel2mat!(Wm, W)
+    gcols = _fit!(c.ws, :gcols, T, (K, N))
+    mul!(gcols, Wm, transpose(G)) # GEMM: (K, Cout) * (Cout, N)
+    gx = _fit!(c.ws, :gx, Tx, size(x)) # gradient wejścia w oryginalnym kształcie (bufor reużywany)
+    _col2im!(gx, gcols, kH, kW, sH, sW, pH, pW, H_out, W_out) # scatter-add okien do pozycji wejścia
+    return (gx, gW)
+end
+
 # Pomocnicze:
 # bias ma kształt "(C_out, 1)", a potrzeba dodać go do tensora
 # reshape "(H_out, W_out, C_out, B)" na "(1, 1, C_out, 1)" rozwiązuje ten problem przez rzutowanie.
@@ -333,6 +533,7 @@ _bias4d(b::AbstractArray) = reshape(b, 1, 1, length(b), 1)
 # 3 wejścia (config, x, W)
 # Config "c" to "Constant(c::Conv)" mający "padding" i "stride" (nietrenowalne).
 forward(::BroadcastedOperator{typeof(conv_op)}, c, x, W) = _conv_forward(c, x, W)
+forward!(out, ::BroadcastedOperator{typeof(conv_op)}, c, x, W) = _conv_forward!(out, c, x, W) # wariant in-place (P1)
 function backward(::BroadcastedOperator{typeof(conv_op)}, c, x, W, g)
     gx, gW = _conv_backward(c, x, W, g)
     return (nothing, gx, gW)   # krotka po KOLEJNOŚCI wejść: (g_c, g_x, g_W); "c" jest Constant -> nic nie zwraca
@@ -342,6 +543,11 @@ end
 # 4 wejścia (config, x, W, b)
 forward(::BroadcastedOperator{typeof(conv_op)}, c, x, W, b) =
     _conv_forward(c, x, W) .+ _bias4d(b) # bias rzutuje się po "(H_out, W_out, B)" (jedyny działający wymiar to C_out)
+function forward!(out, ::BroadcastedOperator{typeof(conv_op)}, c, x, W, b) # wariant in-place (P1)
+    o = _conv_forward!(out, c, x, W)
+    o .+= _bias4d(b) # bias dodawany w miejscu
+    return o
+end
 function backward(::BroadcastedOperator{typeof(conv_op)}, c, x, W, b, g)
     gx, gW = _conv_backward(c, x, W, g)                                      # gradienty po x i W liczymy normalnie (bias nie wpływa)
     # Bias dokłada się element-wise w wymiarze C_out -> dL/db[cout] to suma
@@ -362,16 +568,18 @@ end
 # Funkcja-znacznik, jak "conv_op" - istnieje tylko jako wartość do wyboru metody w "forward" / "backward".
 function maxpool_op end
 
-function _maxpool_forward(m, x::AbstractArray{T,4}) where {T}
+# Optymalizacja P1: wynik pisany do bufora "out" (węzła grafu); każda komórka "y"
+# jest nadpisywana, więc bufor nie wymaga zerowania.
+function _maxpool_forward!(out, m, x::AbstractArray{T,4}) where {T}
     kH, kW = m.pool # rozmiar okna
     sH, sW = m.stride # krok per wymiar
     pH, pW = m.pad # padding per wymiar
     H, Wd, C, B = size(x) # rozmiary wejścia (przestrzenne, kanały, batch)
     H_out = div(H + 2pH - kH, sH) + 1 # rozmiar wyjścia - identyczna formuła jak przy Conv
     W_out = div(Wd + 2pW - kW, sW) + 1
-    y = fill(typemin(T), H_out, W_out, C, B) # bufor wyniku zaczynajacy się od "typemin(T)" żeby każda realna wartość wygrała max
+    y = _ensure(out, T, (H_out, W_out, C, B)) # bufor wyniku (reużywany między iteracjami)
     @inbounds for b = 1:B, c = 1:C, h = 1:H_out, w = 1:W_out # pętla po każdej pozycji wyjścia
-        best = typemin(T) # lokalne maksimum dla bieżącego okna
+        best = typemin(T) # lokalne maksimum dla bieżącego okna; "typemin(T)" - każda realna wartość wygrywa max
         for kh = 1:kH, kw = 1:kW # skan po oknie
             hi = (h - 1) * sH + kh - pH # pozycja w wejściu w osi "height"
             wi = (w - 1) * sW + kw - pW # pozycja w wejściu w osi "width"
@@ -384,6 +592,7 @@ function _maxpool_forward(m, x::AbstractArray{T,4}) where {T}
     end
     return y
 end
+_maxpool_forward(m, x) = _maxpool_forward!(nothing, m, x) # wariant alokujący (pierwsze wywołanie / użycie poza grafem)
 
 # Backward dla MaxPool: 
 #gradient wpada TYLKO do pozycji, która wygrała max
@@ -396,7 +605,10 @@ function _maxpool_backward(m, x::AbstractArray{T,4}, g::AbstractArray{Tg,4}) whe
     pH, pW = m.pad # padding per wymiar
     H, Wd, C, B = size(x) # rozmiary wejścia (przestrzenne, kanały, batch)
     H_out, W_out, _, _ = size(g) # rozmiary gradientu wyjścia (odpowiada kształtowi y z forwarda)
-    gx = zeros(T, size(x)) # gradient wejścia zaczyna od zer; wkłady tylko do pozycji argmax (wygrywających max)
+    # Optymalizacja P1: bufor ":gx" z przestrzeni roboczej warstwy (reużywany między
+    # iteracjami); czytany tylko w obrębie jednego przejścia backward!, więc reużycie jest bezpieczne.
+    gx = _fit!(m.ws, :gx, T, size(x))
+    fill!(gx, zero(T)) # start od zer; wkłady tylko do pozycji argmax (wygrywających max)
     # argmax jest liczony "w locie" (drugi raz) zamiast pamiętać go z forwarda.
     # To oszczędza pamięć; narzut CPU przy standardowych oknach (2 x 2) jest pomijalny.
     @inbounds for b = 1:B, c = 1:C, h = 1:H_out, w = 1:W_out # pętla po wszystkich pozycjach wyjścia
@@ -420,6 +632,7 @@ end
 
 # 2 wejścia operatora: "Constant(m::MaxPool)" (niesie pool/stride/pad) i "x".
 forward(::BroadcastedOperator{typeof(maxpool_op)}, m, x) = _maxpool_forward(m, x)
+forward!(out, ::BroadcastedOperator{typeof(maxpool_op)}, m, x) = _maxpool_forward!(out, m, x) # wariant in-place (P1)
 function backward(::BroadcastedOperator{typeof(maxpool_op)}, m, x, g)
     gx, = _maxpool_backward(m, x, g) # rozpakowanie krotki 1-el.
     return (nothing, gx) # po kolejności: (g_m, g_x); "m" jest Constantem -> nothing
@@ -462,6 +675,30 @@ function forward(::BroadcastedOperator{typeof(dropout_op)}, layer, x)
     layer.mask = mask # CACHE dla backwardu - ta sama maska
     scale = one(T) / (one(T) - p) # "inverted" to skalowanie 1/(1-p) żeby wartość oczekiwana (średnia teoretyczna) E[y] = E[x]
     return x .* mask .* scale # Kazdy element, który mask=true, jest zachowany, resztę zeruje
+end
+
+# Dropout w miejscu (P1): losowanie do bufora ":rand" (rand! bez alokacji),
+# maska reużywana między iteracjami, wynik pisany do bufora "out".
+function forward!(out, ::BroadcastedOperator{typeof(dropout_op)}, layer, x)
+    T = eltype(x)
+    o = _ensure(out, T, size(x)) # bufor wyjścia węzła
+    if !layer.active # tryb ewaluacji - identyczność
+        layer.mask = nothing # sygnał "pass-through" dla backward
+        o .= x # kopia w miejscu (wyjście pozostaje osobną tablicą)
+        return o
+    end
+    p = T(layer.p)
+    r = _fit!(layer.ws, :rand, T, size(x)) # bufor liczb losowych (reużywany)
+    rand!(r) # losowanie z [0,1) w miejscu
+    mask = layer.mask
+    if !(mask isa BitArray) || size(mask) != size(x) # maska reużywana, realokacja tylko przy zmianie kształtu
+        mask = BitArray(undef, size(x))
+        layer.mask = mask
+    end
+    mask .= r .> p # aktualizacja maski w miejscu (true = element zachowany)
+    scale = one(T) / (one(T) - p) # skalowanie "inverted dropout" - E[y] = E[x]
+    o .= x .* mask .* scale
+    return o
 end
 
 function backward(::BroadcastedOperator{typeof(dropout_op)}, layer, x, g)
